@@ -1,0 +1,6 @@
+{
+  "name": "SOCRATES KIDS AI",
+  "description": "Nền tảng gia sư AI Socratic thông minh dành cho học sinh tiểu học Việt Nam từ lớp 1 đến lớp 5 — Think. Explore. Learn.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
