@@ -97,10 +97,13 @@ export function createApiApp() {
   app.get('/api/health', (_req: Request, res: Response) => {
     try {
       db.prepare('SELECT 1 AS ok').get();
+      const geminiKey = process.env.GEMINI_API_KEY?.trim();
+      const aiConfigured = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
       res.json({
         status: 'ok',
         app: 'SOCRATES KIDS AI',
         db: 'connected',
+        aiConfigured,
       });
     } catch (err: unknown) {
       console.error('Health check DB error:', err instanceof Error ? err.message : String(err));

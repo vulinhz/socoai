@@ -1,9 +1,139 @@
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
+export type AiErrorCode =
+  | 'GEMINI_API_KEY_MISSING'
+  | 'GEMINI_API_KEY_INVALID'
+  | 'GEMINI_QUOTA_EXCEEDED'
+  | 'GEMINI_TIMEOUT'
+  | 'GEMINI_MODEL_UNAVAILABLE'
+  | 'INVALID_IMAGE'
+  | 'GEMINI_UPSTREAM_ERROR';
+
+export class AiServiceError extends Error {
+  code: AiErrorCode;
+  status: number;
+  userMessage: string;
+
+  constructor(code: AiErrorCode, status: number, userMessage: string, technicalDetail?: string) {
+    super(technicalDetail ? `${code}: ${technicalDetail}` : code);
+    this.name = 'AiServiceError';
+    this.code = code;
+    this.status = status;
+    this.userMessage = userMessage;
+  }
+}
+
+export function classifyGeminiError(err: unknown): AiServiceError {
+  if (err instanceof AiServiceError) {
+    return err;
+  }
+
+  const errObj = err as { status?: number; code?: string | number; message?: string; name?: string };
+  const rawMsg =
+    err instanceof Error
+      ? err.message
+      : typeof errObj?.message === 'string'
+      ? errObj.message
+      : (() => {
+          try {
+            return JSON.stringify(err);
+          } catch {
+            return String(err);
+          }
+        })();
+  const lower = rawMsg.toLowerCase();
+  const statusNum = Number(errObj?.status || 0);
+
+  if (rawMsg.includes('GEMINI_API_KEY_MISSING')) {
+    return new AiServiceError(
+      'GEMINI_API_KEY_MISSING',
+      503,
+      'Hệ thống AI chưa được cấu hình khóa GEMINI_API_KEY trên máy chủ.',
+      rawMsg
+    );
+  }
+
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('permission_denied') ||
+    statusNum === 401 ||
+    statusNum === 403 ||
+    (lower.includes('400') && lower.includes('api key'))
+  ) {
+    return new AiServiceError(
+      'GEMINI_API_KEY_INVALID',
+      503,
+      'Khóa GEMINI_API_KEY trên máy chủ không hợp lệ hoặc chưa được cấp quyền truy cập Gemini API.',
+      rawMsg
+    );
+  }
+
+  if (lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('rate limit') || statusNum === 429) {
+    return new AiServiceError(
+      'GEMINI_QUOTA_EXCEEDED',
+      429,
+      'Hệ thống AI đang tạm hết hạn mức (quota) hoặc nhận quá nhiều yêu cầu. Vui lòng thử lại sau ít phút.',
+      rawMsg
+    );
+  }
+
+  if (lower.includes('not_found') || statusNum === 404 || (lower.includes('model') && lower.includes('not found'))) {
+    return new AiServiceError(
+      'GEMINI_MODEL_UNAVAILABLE',
+      502,
+      'Mô hình AI được cấu hình hiện không khả dụng. Vui lòng kiểm tra cấu hình máy chủ.',
+      rawMsg
+    );
+  }
+
+  if (
+    lower.includes('unable to process input image') ||
+    lower.includes('invalid image') ||
+    lower.includes('unsupported mime type')
+  ) {
+    return new AiServiceError(
+      'INVALID_IMAGE',
+      400,
+      'Định dạng ảnh chưa hợp lệ hoặc ảnh bị lỗi. Em hãy chọn hoặc chụp lại một bức ảnh rõ nét nhé!',
+      rawMsg
+    );
+  }
+
+  if (
+    errObj?.name === 'AbortError' ||
+    lower.includes('gemini_timeout') ||
+    lower.includes('timeout') ||
+    lower.includes('timed out') ||
+    lower.includes('deadline_exceeded') ||
+    lower.includes('etimedout') ||
+    lower.includes('econnreset') ||
+    lower.includes('fetch failed')
+  ) {
+    return new AiServiceError(
+      'GEMINI_TIMEOUT',
+      504,
+      'Kết nối tới dịch vụ Gemini AI bị quá thời gian phản hồi. Em hãy thử lại nhé!',
+      rawMsg
+    );
+  }
+
+  return new AiServiceError(
+    'GEMINI_UPSTREAM_ERROR',
+    502,
+    'Dịch vụ Gemini AI tạm thời gặp sự cố khi xử lý yêu cầu. Em hãy thử lại sau ít phút nhé!',
+    rawMsg
+  );
+}
+
 function getAiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY_MISSING');
+    throw new AiServiceError(
+      'GEMINI_API_KEY_MISSING',
+      503,
+      'Hệ thống AI chưa được cấu hình khóa GEMINI_API_KEY trên máy chủ.'
+    );
   }
   return new GoogleGenAI({
     apiKey,
@@ -16,17 +146,40 @@ function getAiClient() {
 }
 
 const MODEL_NAME = 'gemini-4-hydrogen';
+const DEFAULT_GEMINI_TIMEOUT_MS = 25000;
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_GEMINI_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('GEMINI_TIMEOUT'));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i <= maxRetries; i++) {
     try {
-      return await fn();
+      return await withTimeout(fn());
     } catch (err: unknown) {
-      lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('GEMINI_API_KEY_MISSING') || msg.includes('400') || msg.includes('403')) {
-        throw err;
+      const classified = classifyGeminiError(err);
+      lastErr = classified;
+      if (
+        classified.code === 'GEMINI_API_KEY_MISSING' ||
+        classified.code === 'GEMINI_API_KEY_INVALID' ||
+        classified.code === 'GEMINI_QUOTA_EXCEEDED' ||
+        classified.code === 'GEMINI_MODEL_UNAVAILABLE' ||
+        classified.code === 'INVALID_IMAGE'
+      ) {
+        throw classified;
       }
       if (i < maxRetries) {
         await new Promise((r) => setTimeout(r, 600 * (i + 1)));
@@ -47,15 +200,75 @@ export interface ScanProblemResult {
   readabilityFeedback: string;
 }
 
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'image/heic',
+  'image/heif',
+]);
+
+function parseImagePayload(rawImageData: string, fallbackMimeType?: string): { mimeType: string; base64: string } {
+  const trimmed = rawImageData.trim();
+  let detectedMime = (fallbackMimeType || 'image/jpeg').trim().toLowerCase();
+  let base64 = trimmed;
+
+  const dataUrlMatch = /^data:([^;,]+);base64,(.+)$/is.exec(trimmed);
+  if (dataUrlMatch) {
+    detectedMime = dataUrlMatch[1].trim().toLowerCase();
+    base64 = dataUrlMatch[2].replace(/\s+/g, '');
+  } else if (trimmed.startsWith('data:')) {
+    throw new AiServiceError(
+      'INVALID_IMAGE',
+      400,
+      'Ảnh gửi lên không đúng định dạng base64 hợp lệ.'
+    );
+  } else {
+    base64 = trimmed.replace(/\s+/g, '');
+  }
+
+  if (detectedMime === 'image/jpg') {
+    detectedMime = 'image/jpeg';
+  }
+
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(detectedMime)) {
+    throw new AiServiceError(
+      'INVALID_IMAGE',
+      400,
+      'Định dạng ảnh chưa được hỗ trợ. Vui lòng chọn ảnh JPEG, PNG hoặc WebP.'
+    );
+  }
+
+  if (!base64 || base64.length < 32 || !/^[A-Za-z0-9+/=]+$/.test(base64)) {
+    throw new AiServiceError(
+      'INVALID_IMAGE',
+      400,
+      'Dữ liệu ảnh không hợp lệ hoặc bị trống. Em hãy chọn lại bức ảnh khác nhé!'
+    );
+  }
+
+  const decodedByteLength = Math.floor((base64.length * 3) / 4);
+  if (decodedByteLength > 4 * 1024 * 1024) {
+    throw new AiServiceError(
+      'INVALID_IMAGE',
+      413,
+      'Ảnh có dung lượng quá lớn (vượt quá 4 MB). Vui lòng cắt gọn hoặc chọn ảnh nhẹ hơn.'
+    );
+  }
+
+  return { mimeType: detectedMime, base64 };
+}
+
 export async function scanProblemImage(
   base64Data: string,
   mimeType: string,
   gradeHint?: number,
   subjectHint?: string
 ): Promise<ScanProblemResult> {
+  const { mimeType: resolvedMimeType, base64: cleanBase64 } = parseImagePayload(base64Data, mimeType);
   const ai = getAiClient();
-
-  const cleanBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
 
   const prompt = `Bạn là hệ thống OCR & phân tích đề bài tiểu học Việt Nam (Lớp 1–5) của SOCRATES KIDS AI.
 Hãy kiểm tra bức ảnh được gửi lên:
@@ -72,7 +285,7 @@ ${subjectHint ? `Gợi ý môn từ học sinh: ${subjectHint}.` : ''}`;
         parts: [
           {
             inlineData: {
-              mimeType: mimeType || 'image/jpeg',
+              mimeType: resolvedMimeType,
               data: cleanBase64,
             },
           },
@@ -108,7 +321,26 @@ ${subjectHint ? `Gợi ý môn từ học sinh: ${subjectHint}.` : ''}`;
       },
     });
 
-    const parsed = JSON.parse((response.text ?? '{}').trim()) as ScanProblemResult;
+    const rawText = (response.text ?? '').trim();
+    if (!rawText) {
+      throw new AiServiceError(
+        'GEMINI_UPSTREAM_ERROR',
+        502,
+        'Gemini AI không trả về nội dung nhận dạng. Em hãy thử chụp lại ảnh rõ hơn nhé!'
+      );
+    }
+
+    let parsed: ScanProblemResult;
+    try {
+      parsed = JSON.parse(rawText) as ScanProblemResult;
+    } catch {
+      throw new AiServiceError(
+        'GEMINI_UPSTREAM_ERROR',
+        502,
+        'Dữ liệu nhận dạng từ AI chưa đúng định dạng. Em hãy thử quét lại nhé!'
+      );
+    }
+
     return {
       isReadable: Boolean(parsed.isReadable),
       safetyPassed: parsed.safetyPassed !== false,

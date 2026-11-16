@@ -172,13 +172,19 @@ export async function refreshAccessToken(): Promise<string | null> {
 function mapNonJsonError(status: number): { message: string; code: string } {
   if (status === 404) {
     return {
-      message: 'Không tìm thấy dịch vụ xác thực trên máy chủ (404). Vui lòng kiểm tra cấu hình API.',
+      message: 'Không tìm thấy dịch vụ API trên máy chủ (404). Vui lòng kiểm tra cấu hình định tuyến API.',
       code: 'API_NOT_FOUND',
+    };
+  }
+  if (status === 413) {
+    return {
+      message: 'Ảnh gửi lên có dung lượng quá lớn so với giới hạn máy chủ (413). Vui lòng chọn ảnh nhẹ hơn hoặc cắt gọn vùng đề bài.',
+      code: 'PAYLOAD_TOO_LARGE',
     };
   }
   if (status === 502 || status === 503 || status === 504) {
     return {
-      message: 'Máy chủ tạm thời không khả dụng hoặc quá tải. Vui lòng thử lại sau ít phút.',
+      message: 'Máy chủ tạm thời không khả dụng hoặc quá thời gian xử lý. Vui lòng thử lại sau ít phút.',
       code: 'BACKEND_UNAVAILABLE',
     };
   }

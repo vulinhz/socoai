@@ -50,6 +50,12 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
     }
   }, [isOpen]);
 
+  useEffect(() => {
+    if (cameraActive && streamRef.current && videoRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+    }
+  }, [cameraActive]);
+
   function stopCamera() {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -61,43 +67,81 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
   async function startCamera() {
     setScanError('');
     setSourceMode('camera');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setScanError('Trình duyệt hiện tại không hỗ trợ mở camera trực tiếp. Em hãy chọn ảnh từ thiết bị nhé!');
+      setSourceMode('upload');
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
       streamRef.current = stream;
       setCameraActive(true);
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      }, 60);
     } catch {
       setScanError('Không thể mở camera trên thiết bị này. Em hãy chuyển sang tải ảnh từ thiết bị nhé!');
       setSourceMode('upload');
     }
   }
 
+  function compressImageRegion(
+    img: HTMLImageElement,
+    sx = 0,
+    sy = 0,
+    sw = img.width,
+    sh = img.height,
+    maxDim = 1600,
+    quality = 0.85
+  ): string {
+    const scale = Math.min(1, maxDim / Math.max(sw, sh));
+    const out = document.createElement('canvas');
+    out.width = Math.max(1, Math.round(sw * scale));
+    out.height = Math.max(1, Math.round(sh * scale));
+    const ctx = out.getContext('2d');
+    if (!ctx) return '';
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+    return out.toDataURL('image/jpeg', quality);
+  }
+
   function captureFromCamera() {
     if (!videoRef.current) return;
     const video = videoRef.current;
+    const rawW = video.videoWidth || 800;
+    const rawH = video.videoHeight || 600;
+    const scale = Math.min(1, 1600 / Math.max(rawW, rawH));
     const c = document.createElement('canvas');
-    c.width = video.videoWidth || 800;
-    c.height = video.videoHeight || 600;
+    c.width = Math.max(1, Math.round(rawW * scale));
+    c.height = Math.max(1, Math.round(rawH * scale));
     const ctx = c.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(video, 0, 0, c.width, c.height);
-    const dataUrl = c.toDataURL('image/jpeg', 0.9);
+    const dataUrl = c.toDataURL('image/jpeg', 0.88);
     stopCamera();
     loadImageToEditor(dataUrl);
   }
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+
+    const hasImageMime = file.type.startsWith('image/');
+    const hasImageExt = /\.(png|jpe?g|webp|gif|heic|heif)$/i.test(file.name);
+    if (file.type && !hasImageMime && !hasImageExt) {
+      setScanError('Vui lòng chọn tệp hình ảnh (JPEG, PNG hoặc WebP).');
+      return;
+    }
+    if (file.size === 0 || file.size > 20 * 1024 * 1024) {
+      setScanError('Tệp ảnh không hợp lệ hoặc vượt quá 20 MB. Vui lòng chọn ảnh khác nhé!');
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
         loadImageToEditor(reader.result);
       }
+    };
+    reader.onerror = () => {
+      setScanError('Không thể đọc tệp ảnh từ thiết bị. Em hãy thử chọn lại nhé!');
     };
     reader.readAsDataURL(file);
   }
@@ -112,6 +156,18 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
     img.onload = () => {
       imgRef.current = img;
       drawCanvas(img, null);
+      // Compress large mobile photos to keep request well below Vercel 4.5 MB limit
+      if (dataUrl.length > 1_500_000 || Math.max(img.width, img.height) > 1600 || !dataUrl.startsWith('data:image/jpeg')) {
+        const compressed = compressImageRegion(img);
+        if (compressed) {
+          setCroppedDataUrl(compressed);
+        }
+      }
+    };
+    img.onerror = () => {
+      setRawImageUrl(null);
+      setCroppedDataUrl(null);
+      setScanError('Không thể hiển thị ảnh này trên trình duyệt. Em hãy chọn ảnh JPEG hoặc PNG nhé!');
     };
     img.src = dataUrl;
   }
@@ -189,23 +245,13 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
       const rw = Math.abs(cropRect.w);
       const rh = Math.abs(cropRect.h);
 
-      const out = document.createElement('canvas');
-      out.width = Math.round((rw / canvas.width) * img.width);
-      out.height = Math.round((rh / canvas.height) * img.height);
-      const ctx = out.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(
-          img,
-          (rx / canvas.width) * img.width,
-          (ry / canvas.height) * img.height,
-          out.width,
-          out.height,
-          0,
-          0,
-          out.width,
-          out.height
-        );
-        setCroppedDataUrl(out.toDataURL('image/jpeg', 0.92));
+      const sx = Math.max(0, (rx / canvas.width) * img.width);
+      const sy = Math.max(0, (ry / canvas.height) * img.height);
+      const sw = Math.max(1, (rw / canvas.width) * img.width);
+      const sh = Math.max(1, (rh / canvas.height) * img.height);
+      const compressedCrop = compressImageRegion(img, sx, sy, sw, sh, 1600, 0.88);
+      if (compressedCrop) {
+        setCroppedDataUrl(compressedCrop);
       }
     }
   }
@@ -213,8 +259,13 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
   function resetCrop() {
     if (rawImageUrl && imgRef.current) {
       setCropRect(null);
-      setCroppedDataUrl(rawImageUrl);
-      drawCanvas(imgRef.current, null);
+      const img = imgRef.current;
+      const normalized =
+        rawImageUrl.length > 1_500_000 || Math.max(img.width, img.height) > 1600 || !rawImageUrl.startsWith('data:image/jpeg')
+          ? compressImageRegion(img) || rawImageUrl
+          : rawImageUrl;
+      setCroppedDataUrl(normalized);
+      drawCanvas(img, null);
     }
   }
 
@@ -223,6 +274,9 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
     setScanning(true);
     setScanError('');
     try {
+      const mimeMatch = /^data:([^;,]+);base64,/i.exec(croppedDataUrl);
+      const resolvedMimeType = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/jpeg';
+
       const data = await apiRequest<{
         result: {
           isReadable: boolean;
@@ -237,7 +291,7 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
         method: 'POST',
         body: JSON.stringify({
           imageData: croppedDataUrl,
-          mimeType: 'image/jpeg',
+          mimeType: resolvedMimeType,
           gradeHint: defaultGrade,
         }),
       });
@@ -318,7 +372,7 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
           <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex flex-col justify-between">
             {sourceMode === 'camera' && cameraActive ? (
               <div className="space-y-3">
-                <video ref={videoRef} autoPlay playsInline className="w-full rounded-xl bg-black aspect-4/3 object-cover" />
+                <video ref={videoRef} autoPlay playsInline muted className="w-full rounded-xl bg-black aspect-4/3 object-cover" />
                 <button
                   type="button"
                   onClick={captureFromCamera}

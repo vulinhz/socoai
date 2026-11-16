@@ -17,6 +17,7 @@ import {
   verifyToken,
 } from './auth.ts';
 import {
+  classifyGeminiError,
   generateParentCompanionAdvice,
   generateSocraticTurn,
   generateTeacherClassInsights,
@@ -696,12 +697,16 @@ apiRouter.post('/ai/scan-problem', authenticate, async (req: AuthRequest, res: R
 
     res.json({ result });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('Scan problem error:', msg);
-    if (msg.includes('GEMINI_API_KEY_MISSING')) {
-      return res.status(503).json({ error: 'Hệ thống AI chưa được cấu hình khóa API trên máy chủ.' });
+    const aiErr = classifyGeminiError(err);
+    console.error('Scan problem error:', aiErr.message);
+    try {
+      db.prepare(
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/scan-problem', 'gemini-4-hydrogen', 'error', ?)`
+      ).run(req.user!.id, Date.now() - start);
+    } catch {
+      // Ignore logging error
     }
-    res.status(500).json({ error: 'SOCO chưa đọc được ảnh lúc này. Em hãy thử lại hoặc gõ đề bài nhé!' });
+    res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
 
@@ -956,16 +961,16 @@ apiRouter.post('/ai/tutor', authenticate, async (req: AuthRequest, res: Response
       user: getFullUserPayload(req.user!.id),
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('Socratic tutor error:', msg);
-    db.prepare(
-      `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', 'gemini-4-hydrogen', 'error', ?)`
-    ).run(req.user!.id, Date.now() - start);
-
-    if (msg.includes('GEMINI_API_KEY_MISSING')) {
-      return res.status(503).json({ error: 'Chưa cấu hình GEMINI_API_KEY trên máy chủ.' });
+    const aiErr = classifyGeminiError(err);
+    console.error('Socratic tutor error:', aiErr.message);
+    try {
+      db.prepare(
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', 'gemini-4-hydrogen', 'error', ?)`
+      ).run(req.user!.id, Date.now() - start);
+    } catch {
+      // Ignore logging error
     }
-    res.status(500).json({ error: 'Kết nối với SOCO đang tạm gián đoạn. Em hãy thử gửi lại nhé!' });
+    res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
 
@@ -1321,9 +1326,10 @@ apiRouter.post('/teacher/ai-insights', authenticate, requireRole('teacher', 'adm
       avgScore: Number(avgScore) || 75,
     });
     res.json({ insights });
-  } catch (err) {
-    console.error('Teacher insights error:', err);
-    res.status(500).json({ error: 'Không thể tạo phân tích AI lúc này.' });
+  } catch (err: unknown) {
+    const aiErr = classifyGeminiError(err);
+    console.error('Teacher insights error:', aiErr.message);
+    res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
 
@@ -1454,9 +1460,10 @@ apiRouter.post('/parent/ai-advice', authenticate, requireRole('parent', 'admin')
     });
 
     res.json({ advice });
-  } catch (err) {
-    console.error('Parent advice error:', err);
-    res.status(500).json({ error: 'Không thể tạo gợi ý đồng hành lúc này.' });
+  } catch (err: unknown) {
+    const aiErr = classifyGeminiError(err);
+    console.error('Parent advice error:', aiErr.message);
+    res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
 
