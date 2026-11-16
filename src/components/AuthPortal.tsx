@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   BookOpen,
   Compass,
@@ -10,20 +10,30 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react';
-import { apiRequest, setAuthToken, UserProfileData, UserRole } from '../lib/api';
+import { apiRequest, setAuthTokens, UserProfileData, UserRole } from '../lib/api';
 import { SocoMascot } from './SocoMascot';
 
 interface AuthPortalProps {
   onAuthenticated: (user: UserProfileData) => void;
+  sessionMessage?: string;
 }
 
 type AuthTab = 'login' | 'register' | 'forgot';
 
-export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
+const USERNAME_REGEX = /^[a-z0-9_.]{3,32}$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function AuthPortal({ onAuthenticated, sessionMessage }: AuthPortalProps) {
   const [tab, setTab] = useState<AuthTab>('login');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [infoMsg, setInfoMsg] = useState('');
+  const [infoMsg, setInfoMsg] = useState(sessionMessage || '');
+
+  useEffect(() => {
+    if (sessionMessage) {
+      setInfoMsg(sessionMessage);
+    }
+  }, [sessionMessage]);
 
   // Login state
   const [loginId, setLoginId] = useState('');
@@ -49,13 +59,20 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
     e.preventDefault();
     setError('');
     setInfoMsg('');
+
+    const cleanIdentifier = loginId.trim();
+    if (!cleanIdentifier || !loginPw) {
+      setError('Vui lòng nhập đầy đủ tên tài khoản (hoặc email) và mật khẩu.');
+      return;
+    }
+
     setLoading(true);
     try {
-      const data = await apiRequest<{ token: string; user: UserProfileData }>('/api/auth/login', {
+      const data = await apiRequest<{ token: string; refreshToken?: string; user: UserProfileData }>('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ identifier: loginId, password: loginPw }),
+        body: JSON.stringify({ identifier: cleanIdentifier, password: loginPw }),
       });
-      setAuthToken(data.token);
+      setAuthTokens(data.token, data.refreshToken ?? null);
       onAuthenticated(data.user);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Đăng nhập không thành công.');
@@ -69,11 +86,11 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
     setInfoMsg('');
     setLoading(true);
     try {
-      const data = await apiRequest<{ token: string; user: UserProfileData }>('/api/auth/login', {
+      const data = await apiRequest<{ token: string; refreshToken?: string; user: UserProfileData }>('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ identifier: username, password }),
       });
-      setAuthToken(data.token);
+      setAuthTokens(data.token, data.refreshToken ?? null);
       onAuthenticated(data.user);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Không thể đăng nhập.');
@@ -86,23 +103,45 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
     e.preventDefault();
     setError('');
     setInfoMsg('');
+
+    const cleanDisplayName = regDisplayName.trim();
+    const cleanUsername = regUsername.trim().toLowerCase();
+    const cleanEmail = regEmail.trim().toLowerCase();
+
+    if (cleanDisplayName.length < 2) {
+      setError('Vui lòng nhập tên hiển thị (ít nhất 2 ký tự).');
+      return;
+    }
+    if (!USERNAME_REGEX.test(cleanUsername)) {
+      setError('Tên tài khoản cần dài 3–32 ký tự, chỉ gồm chữ thường không dấu (a-z), số (0-9), dấu chấm (.) hoặc gạch dưới (_), không chứa dấu cách.');
+      return;
+    }
+    if (regRole !== 'student' && cleanEmail && !EMAIL_REGEX.test(cleanEmail)) {
+      setError('Địa chỉ email không đúng định dạng. Vui lòng kiểm tra lại.');
+      return;
+    }
+    if (regPassword.trim().length < 6) {
+      setError('Mật khẩu quá yếu: cần có ít nhất 6 ký tự và không chỉ gồm khoảng trắng.');
+      return;
+    }
+
     setLoading(true);
     try {
       const payload = {
         role: regRole,
-        displayName: regDisplayName,
-        username: regUsername,
+        displayName: cleanDisplayName,
+        username: cleanUsername,
         password: regPassword,
         gradeLevel: regRole === 'student' ? regGrade : undefined,
-        email: regRole !== 'student' ? regEmail : undefined,
-        schoolName: regRole === 'teacher' ? regSchool : undefined,
-        relationshipLabel: regRole === 'parent' ? regRelation : undefined,
+        email: regRole !== 'student' && cleanEmail ? cleanEmail : undefined,
+        schoolName: regRole === 'teacher' ? regSchool.trim() : undefined,
+        relationshipLabel: regRole === 'parent' ? regRelation.trim() : undefined,
       };
-      const data = await apiRequest<{ token: string; user: UserProfileData; verificationHint?: string }>('/api/auth/register', {
+      const data = await apiRequest<{ token: string; refreshToken?: string; user: UserProfileData; verificationHint?: string }>('/api/auth/register', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
-      setAuthToken(data.token);
+      setAuthTokens(data.token, data.refreshToken ?? null);
       onAuthenticated(data.user);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Đăng ký chưa thành công.');
@@ -309,6 +348,10 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                   <input
                     type="text"
                     required
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    autoComplete="username"
                     value={loginId}
                     onChange={(e) => setLoginId(e.target.value)}
                     placeholder="Ví dụ: minhanh4a"
@@ -321,6 +364,7 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                   <input
                     type="password"
                     required
+                    autoComplete="current-password"
                     value={loginPw}
                     onChange={(e) => setLoginPw(e.target.value)}
                     placeholder="Nhập mật khẩu"
@@ -372,6 +416,7 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                     <input
                       type="text"
                       required
+                      autoComplete="name"
                       value={regDisplayName}
                       onChange={(e) => setRegDisplayName(e.target.value)}
                       placeholder={regRole === 'student' ? 'Ví dụ: Bé Bảo Nam' : 'Họ và tên'}
@@ -399,6 +444,11 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Email</label>
                       <input
                         type="email"
+                        inputMode="email"
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        autoComplete="email"
                         value={regEmail}
                         onChange={(e) => setRegEmail(e.target.value)}
                         placeholder="email@example.com"
@@ -441,6 +491,10 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                   <input
                     type="text"
                     required
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    autoComplete="username"
                     value={regUsername}
                     onChange={(e) => setRegUsername(e.target.value)}
                     placeholder="Ví dụ: baonam_lop3"
@@ -454,6 +508,7 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                     type="password"
                     required
                     minLength={6}
+                    autoComplete="new-password"
                     value={regPassword}
                     onChange={(e) => setRegPassword(e.target.value)}
                     placeholder="Tạo mật khẩu dễ nhớ"
@@ -487,6 +542,10 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                   <input
                     type="text"
                     required
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    autoComplete="username"
                     value={forgotId}
                     onChange={(e) => setForgotId(e.target.value)}
                     placeholder="Nhập tên tài khoản"
@@ -501,6 +560,9 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                       <input
                         type="text"
                         required
+                        autoCapitalize="characters"
+                        autoCorrect="off"
+                        spellCheck={false}
                         value={resetToken}
                         onChange={(e) => setResetToken(e.target.value)}
                         className="w-full px-4 py-3 rounded-xl border border-slate-300 text-sm font-mono-nums"
@@ -512,6 +574,7 @@ export function AuthPortal({ onAuthenticated }: AuthPortalProps) {
                         type="password"
                         required
                         minLength={6}
+                        autoComplete="new-password"
                         value={newPassword}
                         onChange={(e) => setNewPassword(e.target.value)}
                         placeholder="Ít nhất 6 ký tự"

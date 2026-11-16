@@ -6,9 +6,15 @@ import {
   authenticate,
   AuthRequest,
   awardStudentXpAndMissions,
+  clearAuthCookies,
+  parseCookies,
+  REFRESH_COOKIE_NAME,
   requireRole,
+  setAuthCookies,
+  signRefreshToken,
   signToken,
   UserRole,
+  verifyToken,
 } from './auth.ts';
 import {
   generateParentCompanionAdvice,
@@ -18,6 +24,9 @@ import {
 } from './ai.ts';
 
 export const apiRouter = Router();
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const USERNAME_REGEX = /^[a-z0-9_.]{3,32}$/;
 
 function getSetting(key: string, fallback: string): string {
   const row = db.prepare('SELECT value FROM system_settings WHERE key = ?').get(key) as { value: string } | undefined;
@@ -59,34 +68,55 @@ apiRouter.post('/auth/register', (req, res) => {
   try {
     const { username, password, displayName, role, gradeLevel, email, schoolName, relationshipLabel } = req.body || {};
 
-    if (!username || typeof username !== 'string' || username.trim().length < 3) {
-      return res.status(400).json({ error: 'Tên tài khoản cần có ít nhất 3 ký tự.' });
-    }
-    if (!password || typeof password !== 'string' || password.length < 6) {
-      return res.status(400).json({ error: 'Mật khẩu cần có ít nhất 6 ký tự.' });
-    }
     if (!displayName || typeof displayName !== 'string' || displayName.trim().length < 2) {
-      return res.status(400).json({ error: 'Vui lòng nhập tên hiển thị.' });
+      return res.status(400).json({ error: 'Vui lòng nhập tên hiển thị (ít nhất 2 ký tự).', code: 'INVALID_DISPLAY_NAME' });
+    }
+
+    if (!username || typeof username !== 'string') {
+      return res.status(400).json({ error: 'Vui lòng nhập tên tài khoản.', code: 'INVALID_USERNAME' });
+    }
+
+    const cleanUsername = username.trim().toLowerCase();
+    if (!USERNAME_REGEX.test(cleanUsername)) {
+      return res.status(400).json({
+        error: 'Tên tài khoản cần dài 3–32 ký tự, chỉ gồm chữ không dấu (a-z), số (0-9), dấu chấm (.) hoặc gạch dưới (_), không chứa dấu cách.',
+        code: 'INVALID_USERNAME',
+      });
+    }
+
+    if (!password || typeof password !== 'string' || password.trim().length < 6) {
+      return res.status(400).json({
+        error: 'Mật khẩu quá yếu: cần có ít nhất 6 ký tự và không chỉ gồm khoảng trắng.',
+        code: 'WEAK_PASSWORD',
+      });
+    }
+
+    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
+    if (cleanEmail && !EMAIL_REGEX.test(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Địa chỉ email không đúng định dạng. Vui lòng kiểm tra lại.',
+        code: 'INVALID_EMAIL',
+      });
     }
 
     const validRoles: UserRole[] = ['student', 'teacher', 'parent'];
     const targetRole: UserRole = validRoles.includes(role) ? role : 'student';
 
-    const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
-    if (cleanUsername.length < 3) {
-      return res.status(400).json({ error: 'Tên tài khoản chỉ gồm chữ cái không dấu, số và dấu gạch dưới (_).' });
-    }
-
     const existingUser = db.prepare('SELECT id FROM users WHERE username = ?').get(cleanUsername);
     if (existingUser) {
-      return res.status(409).json({ error: 'Tên tài khoản này đã được sử dụng. Hãy chọn tên khác nhé!' });
+      return res.status(409).json({
+        error: 'Tên tài khoản này đã được sử dụng. Hãy chọn tên khác nhé!',
+        code: 'USERNAME_EXISTS',
+      });
     }
 
-    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
     if (cleanEmail) {
       const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
       if (existingEmail) {
-        return res.status(409).json({ error: 'Email này đã được đăng ký.' });
+        return res.status(409).json({
+          error: 'Email này đã được đăng ký. Bạn có thể đăng nhập hoặc dùng chức năng Quên mật khẩu.',
+          code: 'EMAIL_EXISTS',
+        });
       }
     }
 
@@ -94,154 +124,257 @@ apiRouter.post('/auth/register', (req, res) => {
     const verificationCode = String(Math.floor(100000 + Math.random() * 900000));
     const parentalConsentStatus = targetRole === 'student' ? 'pending' : 'not_required';
 
-    const userId = db
-      .prepare(
-        `INSERT INTO users (username, email, password_hash, display_name, role, is_verified, verification_code, parental_consent_status, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`
-      )
-      .run(
-        cleanUsername,
-        cleanEmail,
-        passwordHash,
-        displayName.trim(),
-        targetRole,
-        targetRole === 'student' ? 1 : 0,
-        verificationCode,
-        parentalConsentStatus
-      ).lastInsertRowid as number;
+    const createAccountTx = db.transaction(() => {
+      const newUserId = db
+        .prepare(
+          `INSERT INTO users (username, email, password_hash, display_name, role, is_verified, verification_code, parental_consent_status, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+        )
+        .run(
+          cleanUsername,
+          cleanEmail,
+          passwordHash,
+          displayName.trim(),
+          targetRole,
+          targetRole === 'student' ? 1 : 0,
+          verificationCode,
+          parentalConsentStatus
+        ).lastInsertRowid as number;
 
-    if (targetRole === 'student') {
-      const level = Math.min(5, Math.max(1, Number(gradeLevel) || 4));
-      const gradeRow = db.prepare('SELECT id FROM grades WHERE level = ?').get(level) as { id: number };
-      const linkCode = 'LINK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
-      db.prepare(
-        `INSERT INTO student_profiles (user_id, grade_id, xp, level, streak_days, last_active_date, link_code)
-         VALUES (?, ?, 50, 1, 1, ?, ?)`
-      ).run(userId, gradeRow.id, new Date().toISOString().slice(0, 10), linkCode);
-    } else if (targetRole === 'teacher') {
-      db.prepare(`INSERT INTO teacher_profiles (user_id, school_name) VALUES (?, ?)`).run(
-        userId,
-        (schoolName && String(schoolName).trim()) || 'Trường Tiểu học'
-      );
-    } else if (targetRole === 'parent') {
-      db.prepare(`INSERT INTO parent_profiles (user_id, relationship_label) VALUES (?, ?)`).run(
-        userId,
-        (relationshipLabel && String(relationshipLabel).trim()) || 'Phụ huynh'
-      );
-    }
+      if (targetRole === 'student') {
+        const level = Math.min(5, Math.max(1, Number(gradeLevel) || 4));
+        const gradeRow = db.prepare('SELECT id FROM grades WHERE level = ?').get(level) as { id: number } | undefined;
+        if (!gradeRow) {
+          throw new Error('GRADE_NOT_FOUND');
+        }
+        const linkCode = 'LINK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+        db.prepare(
+          `INSERT INTO student_profiles (user_id, grade_id, xp, level, streak_days, last_active_date, link_code)
+           VALUES (?, ?, 50, 1, 1, ?, ?)`
+        ).run(newUserId, gradeRow.id, new Date().toISOString().slice(0, 10), linkCode);
+      } else if (targetRole === 'teacher') {
+        db.prepare(`INSERT INTO teacher_profiles (user_id, school_name) VALUES (?, ?)`).run(
+          newUserId,
+          (schoolName && String(schoolName).trim()) || 'Trường Tiểu học'
+        );
+      } else if (targetRole === 'parent') {
+        db.prepare(`INSERT INTO parent_profiles (user_id, relationship_label) VALUES (?, ?)`).run(
+          newUserId,
+          (relationshipLabel && String(relationshipLabel).trim()) || 'Phụ huynh'
+        );
+      }
 
+      return newUserId;
+    });
+
+    const userId = createAccountTx();
     const user = getFullUserPayload(userId);
-    const token = signToken({
+    const tokenPayload = {
       id: userId,
       username: cleanUsername,
       role: targetRole,
       displayName: displayName.trim(),
-    });
+    };
+    const token = signToken(tokenPayload);
+    const refreshToken = signRefreshToken(tokenPayload);
+    setAuthCookies(req, res, token, refreshToken);
 
     res.status(201).json({
       token,
+      refreshToken,
       user,
       verificationHint: targetRole !== 'student' ? verificationCode : undefined,
     });
-  } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: 'Không thể tạo tài khoản lúc này. Vui lòng thử lại.' });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('Register error:', errMsg);
+    if (errMsg.includes('UNIQUE constraint failed: users.email')) {
+      return res.status(409).json({ error: 'Email này đã được đăng ký.', code: 'EMAIL_EXISTS' });
+    }
+    if (errMsg.includes('UNIQUE constraint failed: users.username')) {
+      return res.status(409).json({ error: 'Tên tài khoản này đã được sử dụng.', code: 'USERNAME_EXISTS' });
+    }
+    res.status(500).json({
+      error: 'Hệ thống cơ sở dữ liệu tạm thời gặp sự cố khi tạo tài khoản. Vui lòng thử lại sau ít phút.',
+      code: 'DB_ERROR',
+    });
   }
 });
 
 apiRouter.post('/auth/login', (req, res) => {
   try {
     const { identifier, password } = req.body || {};
-    if (!identifier || !password) {
-      return res.status(400).json({ error: 'Vui lòng nhập tên tài khoản (hoặc email) và mật khẩu.' });
+    if (!identifier || typeof identifier !== 'string' || !identifier.trim() || !password || typeof password !== 'string') {
+      return res.status(400).json({
+        error: 'Vui lòng nhập đầy đủ tên tài khoản (hoặc email) và mật khẩu.',
+        code: 'MISSING_CREDENTIALS',
+      });
     }
-    const cleanId = String(identifier).trim().toLowerCase();
+    const cleanId = identifier.trim().toLowerCase();
     const userRow = db
-      .prepare('SELECT id, username, password_hash, display_name, role, status FROM users WHERE username = ? OR email = ?')
+      .prepare('SELECT id, username, password_hash, display_name, role, status FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?')
       .get(cleanId, cleanId) as
       | { id: number; username: string; password_hash: string; display_name: string; role: UserRole; status: string }
       | undefined;
 
-    if (!userRow || !bcrypt.compareSync(String(password), userRow.password_hash)) {
-      return res.status(401).json({ error: 'Tên đăng nhập hoặc mật khẩu chưa đúng.' });
+    if (!userRow || !bcrypt.compareSync(password, userRow.password_hash)) {
+      return res.status(401).json({
+        error: 'Tên đăng nhập, email hoặc mật khẩu chưa chính xác.',
+        code: 'INVALID_CREDENTIALS',
+      });
     }
     if (userRow.status === 'suspended') {
-      return res.status(403).json({ error: 'Tài khoản này hiện đang tạm khóa. Vui lòng liên hệ quản trị viên.' });
+      return res.status(403).json({
+        error: 'Tài khoản này hiện đang tạm khóa. Vui lòng liên hệ quản trị viên.',
+        code: 'ACCOUNT_SUSPENDED',
+      });
     }
 
-    const token = signToken({
+    const tokenPayload = {
       id: userRow.id,
       username: userRow.username,
       role: userRow.role,
       displayName: userRow.display_name,
-    });
+    };
+    const token = signToken(tokenPayload);
+    const refreshToken = signRefreshToken(tokenPayload);
+    setAuthCookies(req, res, token, refreshToken);
+
     const user = getFullUserPayload(userRow.id);
-    res.json({ token, user });
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Đăng nhập thất bại. Vui lòng thử lại.' });
+    res.json({ token, refreshToken, user });
+  } catch (err: unknown) {
+    console.error('Login error:', err instanceof Error ? err.message : String(err));
+    res.status(500).json({
+      error: 'Hệ thống xác thực tạm thời gặp sự cố. Vui lòng thử lại sau ít phút.',
+      code: 'DB_ERROR',
+    });
   }
+});
+
+apiRouter.post('/auth/refresh', (req, res) => {
+  try {
+    const cookies = parseCookies(req.headers.cookie);
+    const rawRefresh = (req.body && req.body.refreshToken) || cookies[REFRESH_COOKIE_NAME];
+    if (!rawRefresh || typeof rawRefresh !== 'string') {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.', code: 'TOKEN_EXPIRED' });
+    }
+
+    const decoded = verifyToken(rawRefresh);
+    if (decoded.tokenType !== 'refresh') {
+      return res.status(401).json({ error: 'Refresh token không hợp lệ.', code: 'UNAUTHORIZED' });
+    }
+
+    const userRow = db
+      .prepare('SELECT id, username, display_name, role, status FROM users WHERE id = ?')
+      .get(decoded.id) as { id: number; username: string; display_name: string; role: UserRole; status: string } | undefined;
+
+    if (!userRow || userRow.status === 'suspended') {
+      clearAuthCookies(req, res);
+      return res.status(401).json({ error: 'Tài khoản không khả dụng.', code: 'UNAUTHORIZED' });
+    }
+
+    const tokenPayload = {
+      id: userRow.id,
+      username: userRow.username,
+      role: userRow.role,
+      displayName: userRow.display_name,
+    };
+    const newAccessToken = signToken(tokenPayload);
+    const newRefreshToken = signRefreshToken(tokenPayload);
+    setAuthCookies(req, res, newAccessToken, newRefreshToken);
+
+    res.json({ token: newAccessToken, refreshToken: newRefreshToken, user: getFullUserPayload(userRow.id) });
+  } catch (err: unknown) {
+    console.error('Refresh token error:', err instanceof Error ? err.message : String(err));
+    clearAuthCookies(req, res);
+    res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.', code: 'TOKEN_EXPIRED' });
+  }
+});
+
+apiRouter.post('/auth/logout', (req, res) => {
+  clearAuthCookies(req, res);
+  res.json({ ok: true, message: 'Đã đăng xuất an toàn.' });
 });
 
 apiRouter.get('/auth/me', authenticate, (req: AuthRequest, res: Response) => {
   const user = getFullUserPayload(req.user!.id);
-  if (!user) return res.status(404).json({ error: 'Không tìm thấy tài khoản.' });
+  if (!user) return res.status(404).json({ error: 'Không tìm thấy tài khoản.', code: 'NOT_FOUND' });
   res.json({ user });
 });
 
 apiRouter.post('/auth/verify', authenticate, (req: AuthRequest, res: Response) => {
   const { code } = req.body || {};
   const row = db.prepare('SELECT verification_code FROM users WHERE id = ?').get(req.user!.id) as { verification_code: string | null } | undefined;
-  if (!row || (row.verification_code && row.verification_code !== String(code).trim())) {
-    return res.status(400).json({ error: 'Mã xác minh chưa chính xác.' });
+  if (!row || (row.verification_code && row.verification_code !== String(code || '').trim())) {
+    return res.status(400).json({ error: 'Mã xác minh chưa chính xác.', code: 'INVALID_VERIFICATION_CODE' });
   }
   db.prepare(`UPDATE users SET is_verified = 1, verification_code = NULL, updated_at = datetime('now') WHERE id = ?`).run(req.user!.id);
   res.json({ user: getFullUserPayload(req.user!.id), message: 'Tài khoản đã được xác minh thành công!' });
 });
 
 apiRouter.post('/auth/forgot-password', (req, res) => {
-  const { identifier } = req.body || {};
-  if (!identifier) return res.status(400).json({ error: 'Vui lòng nhập tên tài khoản hoặc email.' });
-  const cleanId = String(identifier).trim().toLowerCase();
-  const row = db.prepare('SELECT id FROM users WHERE username = ? OR email = ?').get(cleanId, cleanId) as { id: number } | undefined;
-  if (!row) {
-    return res.status(404).json({ error: 'Không tìm thấy tài khoản phù hợp.' });
+  try {
+    const { identifier } = req.body || {};
+    if (!identifier || typeof identifier !== 'string' || !identifier.trim()) {
+      return res.status(400).json({ error: 'Vui lòng nhập tên tài khoản hoặc email.', code: 'MISSING_IDENTIFIER' });
+    }
+    const cleanId = identifier.trim().toLowerCase();
+    const row = db
+      .prepare('SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?')
+      .get(cleanId, cleanId) as { id: number } | undefined;
+    if (!row) {
+      return res.status(404).json({ error: 'Không tìm thấy tài khoản phù hợp.', code: 'NOT_FOUND' });
+    }
+    const resetToken = crypto.randomBytes(3).toString('hex').toUpperCase();
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    db.prepare(`UPDATE users SET reset_token = ?, reset_expires_at = ?, updated_at = datetime('now') WHERE id = ?`).run(
+      resetToken,
+      expiresAt,
+      row.id
+    );
+    res.json({
+      message: 'Mã khôi phục mật khẩu đã được tạo (hiệu lực 30 phút).',
+      resetTokenPreview: resetToken,
+    });
+  } catch (err: unknown) {
+    console.error('Forgot password error:', err instanceof Error ? err.message : String(err));
+    res.status(500).json({ error: 'Không thể xử lý yêu cầu khôi phục mật khẩu. Vui lòng thử lại sau.', code: 'DB_ERROR' });
   }
-  const resetToken = crypto.randomBytes(3).toString('hex').toUpperCase();
-  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-  db.prepare(`UPDATE users SET reset_token = ?, reset_expires_at = ?, updated_at = datetime('now') WHERE id = ?`).run(
-    resetToken,
-    expiresAt,
-    row.id
-  );
-  res.json({
-    message: 'Mã khôi phục mật khẩu đã được tạo (hiệu lực 30 phút).',
-    resetTokenPreview: resetToken,
-  });
 });
 
 apiRouter.post('/auth/reset-password', (req, res) => {
-  const { identifier, resetToken, newPassword } = req.body || {};
-  if (!identifier || !resetToken || !newPassword || String(newPassword).length < 6) {
-    return res.status(400).json({ error: 'Vui lòng nhập đầy đủ mã khôi phục và mật khẩu mới (ít nhất 6 ký tự).' });
-  }
-  const cleanId = String(identifier).trim().toLowerCase();
-  const row = db
-    .prepare('SELECT id, reset_token, reset_expires_at FROM users WHERE username = ? OR email = ?')
-    .get(cleanId, cleanId) as { id: number; reset_token: string | null; reset_expires_at: string | null } | undefined;
+  try {
+    const { identifier, resetToken, newPassword } = req.body || {};
+    if (!identifier || typeof identifier !== 'string' || !identifier.trim() || !resetToken || typeof resetToken !== 'string' || !resetToken.trim()) {
+      return res.status(400).json({ error: 'Vui lòng nhập đầy đủ tài khoản và mã khôi phục.', code: 'MISSING_RESET_FIELDS' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 6) {
+      return res.status(400).json({
+        error: 'Mật khẩu mới quá yếu: cần ít nhất 6 ký tự và không chỉ gồm khoảng trắng.',
+        code: 'WEAK_PASSWORD',
+      });
+    }
+    const cleanId = identifier.trim().toLowerCase();
+    const row = db
+      .prepare('SELECT id, reset_token, reset_expires_at FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?')
+      .get(cleanId, cleanId) as { id: number; reset_token: string | null; reset_expires_at: string | null } | undefined;
 
-  if (!row || !row.reset_token || row.reset_token !== String(resetToken).trim().toUpperCase()) {
-    return res.status(400).json({ error: 'Mã khôi phục không hợp lệ.' });
+    if (!row || !row.reset_token || row.reset_token !== resetToken.trim().toUpperCase()) {
+      return res.status(400).json({ error: 'Mã khôi phục không hợp lệ.', code: 'INVALID_RESET_TOKEN' });
+    }
+    if (row.reset_expires_at && new Date(row.reset_expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'Mã khôi phục đã hết hạn.', code: 'RESET_TOKEN_EXPIRED' });
+    }
+    const hash = bcrypt.hashSync(newPassword, 10);
+    db.prepare(`UPDATE users SET password_hash = ?, reset_token = NULL, reset_expires_at = NULL, updated_at = datetime('now') WHERE id = ?`).run(
+      hash,
+      row.id
+    );
+    res.json({ message: 'Đổi mật khẩu thành công! Em có thể đăng nhập ngay.' });
+  } catch (err: unknown) {
+    console.error('Reset password error:', err instanceof Error ? err.message : String(err));
+    res.status(500).json({ error: 'Hệ thống gặp sự cố khi đổi mật khẩu. Vui lòng thử lại sau.', code: 'DB_ERROR' });
   }
-  if (row.reset_expires_at && new Date(row.reset_expires_at).getTime() < Date.now()) {
-    return res.status(400).json({ error: 'Mã khôi phục đã hết hạn.' });
-  }
-  const hash = bcrypt.hashSync(String(newPassword), 10);
-  db.prepare(`UPDATE users SET password_hash = ?, reset_token = NULL, reset_expires_at = NULL, updated_at = datetime('now') WHERE id = ?`).run(
-    hash,
-    row.id
-  );
-  res.json({ message: 'Đổi mật khẩu thành công! Em có thể đăng nhập ngay.' });
 });
 
 apiRouter.patch('/auth/profile', authenticate, (req: AuthRequest, res: Response) => {

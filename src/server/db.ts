@@ -1,17 +1,58 @@
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const dataDir = path.resolve(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+function resolveWritableDbPath(): string {
+  if (process.env.DATABASE_PATH) {
+    const customDir = path.dirname(path.resolve(process.env.DATABASE_PATH));
+    fs.mkdirSync(customDir, { recursive: true });
+    return path.resolve(process.env.DATABASE_PATH);
+  }
+
+  const localDataDir = path.resolve(process.cwd(), 'data');
+  const localDbPath = path.join(localDataDir, 'socrates.db');
+
+  if (!process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    try {
+      if (!fs.existsSync(localDataDir)) {
+        fs.mkdirSync(localDataDir, { recursive: true });
+      }
+      fs.accessSync(localDataDir, fs.constants.W_OK);
+      return localDbPath;
+    } catch {
+      // Fall through to writable temp directory
+    }
+  }
+
+  const tmpDataDir = path.join(os.tmpdir(), 'socrates-data');
+  const tmpDbPath = path.join(tmpDataDir, 'socrates.db');
+  if (!fs.existsSync(tmpDataDir)) {
+    fs.mkdirSync(tmpDataDir, { recursive: true });
+  }
+  if (!fs.existsSync(tmpDbPath) && fs.existsSync(localDbPath)) {
+    try {
+      fs.copyFileSync(localDbPath, tmpDbPath);
+    } catch (err) {
+      console.warn('Could not copy bundled database to temp dir, initializing fresh DB:', err);
+    }
+  }
+  return tmpDbPath;
 }
 
-const dbPath = path.join(dataDir, 'socrates.db');
+const dbPath = resolveWritableDbPath();
 export const db = new Database(dbPath);
 
-db.pragma('journal_mode = WAL');
+try {
+  db.pragma('journal_mode = WAL');
+} catch {
+  try {
+    db.pragma('journal_mode = DELETE');
+  } catch {
+    // Ignore pragma failure on constrained filesystems
+  }
+}
 db.pragma('foreign_keys = ON');
 
 export function initDatabase() {

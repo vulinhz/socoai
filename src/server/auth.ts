@@ -9,6 +9,7 @@ export interface AuthUserPayload {
   username: string;
   role: UserRole;
   displayName: string;
+  tokenType?: 'access' | 'refresh';
 }
 
 export interface AuthRequest extends Request {
@@ -17,29 +18,115 @@ export interface AuthRequest extends Request {
 
 const JWT_SECRET = process.env.JWT_SECRET || 'socrates-kids-ai-dev-secret-2026';
 
+export const ACCESS_COOKIE_NAME = 'socrates_access_token';
+export const REFRESH_COOKIE_NAME = 'socrates_refresh_token';
+
 export function signToken(payload: AuthUserPayload): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign({ ...payload, tokenType: 'access' }, JWT_SECRET, { expiresIn: '1d' });
+}
+
+export function signRefreshToken(payload: AuthUserPayload): string {
+  return jwt.sign({ ...payload, tokenType: 'refresh' }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 export function verifyToken(token: string): AuthUserPayload {
   return jwt.verify(token, JWT_SECRET) as AuthUserPayload;
 }
 
+export function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const key = part.slice(0, idx).trim();
+      const val = part.slice(idx + 1).trim();
+      try {
+        cookies[key] = decodeURIComponent(val);
+      } catch {
+        cookies[key] = val;
+      }
+    }
+  }
+  return cookies;
+}
+
+export function isHttpsRequest(req: Request): boolean {
+  const xfProto = req.headers['x-forwarded-proto'];
+  if (typeof xfProto === 'string' && xfProto.split(',')[0].trim() === 'https') return true;
+  if (req.secure) return true;
+  if (process.env.VERCEL === '1' || process.env.NODE_ENV === 'production') return true;
+  return false;
+}
+
+export function setAuthCookies(req: Request, res: Response, accessToken: string, refreshToken: string) {
+  const secure = isHttpsRequest(req);
+  res.cookie(ACCESS_COOKIE_NAME, accessToken, {
+    httpOnly: true,
+    secure,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+  res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
+    httpOnly: true,
+    secure,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+}
+
+export function clearAuthCookies(req: Request, res: Response) {
+  const secure = isHttpsRequest(req);
+  res.clearCookie(ACCESS_COOKIE_NAME, { httpOnly: true, secure, sameSite: 'lax', path: '/' });
+  res.clearCookie(REFRESH_COOKIE_NAME, { httpOnly: true, secure, sameSite: 'lax', path: '/' });
+}
+
 export function authenticate(req: AuthRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Vui lòng đăng nhập để tiếp tục.' });
+  const cookies = parseCookies(req.headers.cookie);
+  let token: string | null = null;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice(7).trim();
+  } else if (cookies[ACCESS_COOKIE_NAME]) {
+    token = cookies[ACCESS_COOKIE_NAME];
   }
-  const token = authHeader.slice(7).trim();
+
+  if (!token) {
+    return res.status(401).json({
+      error: 'Vui lòng đăng nhập để tiếp tục.',
+      code: 'UNAUTHORIZED',
+    });
+  }
+
   try {
     const decoded = verifyToken(token);
+    if (decoded.tokenType === 'refresh') {
+      return res.status(401).json({
+        error: 'Token không hợp lệ cho phiên truy cập.',
+        code: 'UNAUTHORIZED',
+      });
+    }
+
     const dbUser = db
       .prepare('SELECT id, username, role, display_name, status FROM users WHERE id = ?')
       .get(decoded.id) as { id: number; username: string; role: UserRole; display_name: string; status: string } | undefined;
 
-    if (!dbUser || dbUser.status === 'suspended') {
-      return res.status(401).json({ error: 'Tài khoản không tồn tại hoặc đang bị tạm khóa.' });
+    if (!dbUser) {
+      return res.status(401).json({
+        error: 'Tài khoản không tồn tại hoặc đã bị xóa.',
+        code: 'UNAUTHORIZED',
+      });
     }
+    if (dbUser.status === 'suspended') {
+      return res.status(403).json({
+        error: 'Tài khoản này đang bị tạm khóa. Vui lòng liên hệ quản trị viên.',
+        code: 'ACCOUNT_SUSPENDED',
+      });
+    }
+
     req.user = {
       id: dbUser.id,
       username: dbUser.username,
@@ -47,18 +134,22 @@ export function authenticate(req: AuthRequest, res: Response, next: NextFunction
       displayName: dbUser.display_name,
     };
     next();
-  } catch {
-    return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.' });
+  } catch (err: unknown) {
+    const isExpired = err instanceof Error && err.name === 'TokenExpiredError';
+    return res.status(401).json({
+      error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.',
+      code: isExpired ? 'TOKEN_EXPIRED' : 'UNAUTHORIZED',
+    });
   }
 }
 
 export function requireRole(...allowedRoles: UserRole[]) {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Chưa xác thực người dùng.' });
+      return res.status(401).json({ error: 'Chưa xác thực người dùng.', code: 'UNAUTHORIZED' });
     }
     if (!allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Bạn không có quyền thực hiện thao tác này.' });
+      return res.status(403).json({ error: 'Bạn không có quyền thực hiện thao tác này.', code: 'FORBIDDEN' });
     }
     next();
   };

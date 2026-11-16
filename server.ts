@@ -2,21 +2,11 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { apiRouter } from './src/server/routes.ts';
-import './src/server/db.ts';
+import { createApiApp } from './src/server/app.ts';
 
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
-
-  app.use(express.json({ limit: '15mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '15mb' }));
-
-  app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', app: 'SOCRATES KIDS AI' });
-  });
-
-  app.use('/api', apiRouter);
+  const app = createApiApp();
+  const PORT = Number(process.env.PORT) || 3000;
 
   if (process.env.NODE_ENV === 'production') {
     const distPath = path.resolve(process.cwd(), 'dist');

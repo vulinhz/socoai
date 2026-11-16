@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Compass, LogOut, Menu, X } from 'lucide-react';
-import { apiRequest, getAuthToken, setAuthToken, UserProfileData } from './lib/api';
+import { apiRequest, setAuthTokens, UserProfileData } from './lib/api';
 import { AuthPortal } from './components/AuthPortal';
 import { StudentWorld } from './components/StudentWorld';
 import { SocraticTutorView } from './components/SocraticTutorView';
@@ -31,6 +31,7 @@ function defaultPageForRole(role: UserProfileData['role']): AppPage {
 export default function App() {
   const [user, setUser] = useState<UserProfileData | null>(null);
   const [booting, setBooting] = useState(true);
+  const [sessionMessage, setSessionMessage] = useState('');
   const [page, setPage] = useState<AppPage>('student_world');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -44,31 +45,54 @@ export default function App() {
   const [subjectFilter, setSubjectFilter] = useState<number | undefined>(undefined);
 
   useEffect(() => {
-    const token = getAuthToken();
-    if (!token) {
-      setBooting(false);
-      return;
-    }
+    let cancelled = false;
     apiRequest<{ user: UserProfileData }>('/api/auth/me')
       .then((res) => {
-        setUser(res.user);
-        setPage(defaultPageForRole(res.user.role));
+        if (!cancelled) {
+          setUser(res.user);
+          setPage(defaultPageForRole(res.user.role));
+          setSessionMessage('');
+        }
       })
       .catch(() => {
-        setAuthToken(null);
+        if (!cancelled) {
+          setAuthTokens(null, null);
+        }
       })
       .finally(() => {
-        setBooting(false);
+        if (!cancelled) {
+          setBooting(false);
+        }
       });
+
+    const onSessionExpired = (event: Event) => {
+      const customEvent = event as CustomEvent<{ message?: string }>;
+      setAuthTokens(null, null);
+      setUser(null);
+      setTutorOpts({});
+      setSubjectFilter(undefined);
+      setSessionMessage(customEvent.detail?.message || 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+    };
+
+    window.addEventListener('socrates:session-expired', onSessionExpired);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('socrates:session-expired', onSessionExpired);
+    };
   }, []);
 
   function handleAuthenticated(loggedUser: UserProfileData) {
+    setSessionMessage('');
     setUser(loggedUser);
     setPage(defaultPageForRole(loggedUser.role));
   }
 
   function handleLogout() {
-    setAuthToken(null);
+    apiRequest('/api/auth/logout', { method: 'POST' }).catch(() => {
+      // Ignore network errors when clearing local session
+    });
+    setAuthTokens(null, null);
+    setSessionMessage('');
     setUser(null);
     setTutorOpts({});
     setSubjectFilter(undefined);
@@ -88,7 +112,7 @@ export default function App() {
   }
 
   if (!user) {
-    return <AuthPortal onAuthenticated={handleAuthenticated} />;
+    return <AuthPortal onAuthenticated={handleAuthenticated} sessionMessage={sessionMessage} />;
   }
 
   const navItems: Array<{ id: AppPage; label: string }> =
