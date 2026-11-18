@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Camera, CheckCircle2, Crop, RefreshCw, ScanSearch, Upload, X, AlertTriangle } from 'lucide-react';
+import { Camera, CheckCircle2, Crop, RefreshCw, ScanSearch, Upload, X, AlertTriangle, WifiOff } from 'lucide-react';
 import { apiRequest } from '../lib/api';
+import { useOnlineStatus } from './PwaControls';
 
 export interface ScannedProblemPayload {
   extractedText: string;
@@ -18,6 +19,7 @@ interface ProblemScannerModalProps {
 }
 
 export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfirmProblem }: ProblemScannerModalProps) {
+  const isOnline = useOnlineStatus();
   const [sourceMode, setSourceMode] = useState<'upload' | 'camera'>('upload');
   const [rawImageUrl, setRawImageUrl] = useState<string | null>(null);
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
@@ -47,8 +49,17 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
   useEffect(() => {
     if (!isOpen) {
       stopCamera();
+      return;
     }
-  }, [isOpen]);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        stopCamera();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
 
   useEffect(() => {
     if (cameraActive && streamRef.current && videoRef.current) {
@@ -156,7 +167,6 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
     img.onload = () => {
       imgRef.current = img;
       drawCanvas(img, null);
-      // Compress large mobile photos to keep request well below Vercel 4.5 MB limit
       if (dataUrl.length > 1_500_000 || Math.max(img.width, img.height) > 1600 || !dataUrl.startsWith('data:image/jpeg')) {
         const compressed = compressImageRegion(img);
         if (compressed) {
@@ -271,6 +281,11 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
 
   async function runScan() {
     if (!croppedDataUrl) return;
+    if (!isOnline || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+      setScanError('Tính năng đọc ảnh đề bài bằng AI cần kết nối mạng (Wi-Fi/4G). Em hãy kiểm tra mạng rồi thử lại nhé!');
+      return;
+    }
+
     setScanning(true);
     setScanError('');
     try {
@@ -314,12 +329,19 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="scanner-modal-title"
+      className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4"
+    >
       <div className="bg-white border border-slate-200 rounded-3xl max-w-4xl w-full max-h-[92vh] overflow-y-auto p-6 shadow-xl">
         <div className="flex items-center justify-between pb-4 border-b border-slate-100">
           <div>
-            <h2 className="font-display text-xl font-extrabold text-slate-900">Quét Đề Bài Bằng Ảnh</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
+            <h2 id="scanner-modal-title" className="font-display text-xl font-extrabold text-slate-900">
+              Quét Đề Bài Bằng Ảnh
+            </h2>
+            <p className="text-xs text-slate-600 mt-0.5">
               Chụp hoặc tải ảnh bài tập · Kéo chọn vùng cần đọc · Kiểm tra lại chữ trước khi hỏi SOCO
             </p>
           </div>
@@ -329,14 +351,20 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
               stopCamera();
               onClose();
             }}
-            className="p-2 rounded-xl hover:bg-slate-100 text-slate-600 cursor-pointer"
+            className="p-2 rounded-xl hover:bg-slate-100 text-slate-700 cursor-pointer"
             aria-label="Đóng trình quét ảnh"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Mode buttons */}
+        {!isOnline && (
+          <div role="status" className="mt-3 p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-950 flex items-center gap-2">
+            <WifiOff className="w-4 h-4 text-amber-700 shrink-0" aria-hidden="true" />
+            <span>Em đang ngoại tuyến. Tính năng nhận dạng ảnh Gemini Vision cần kết nối internet.</span>
+          </div>
+        )}
+
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -345,30 +373,31 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
               setSourceMode('upload');
             }}
             className={`px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 border cursor-pointer ${
-              sourceMode === 'upload' ? 'bg-sky-50 border-sky-500 text-sky-800' : 'border-slate-200 text-slate-700'
+              sourceMode === 'upload' ? 'bg-sky-50 border-sky-500 text-sky-900' : 'border-slate-200 text-slate-700'
             }`}
           >
-            <Upload className="w-4 h-4" />
+            <Upload className="w-4 h-4" aria-hidden="true" />
             <span>Tải ảnh từ thiết bị</span>
           </button>
           <button
             type="button"
             onClick={startCamera}
             className={`px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 border cursor-pointer ${
-              sourceMode === 'camera' ? 'bg-sky-50 border-sky-500 text-sky-800' : 'border-slate-200 text-slate-700'
+              sourceMode === 'camera' ? 'bg-sky-50 border-sky-500 text-sky-900' : 'border-slate-200 text-slate-700'
             }`}
           >
-            <Camera className="w-4 h-4" />
+            <Camera className="w-4 h-4" aria-hidden="true" />
             <span>Mở Camera chụp đề</span>
           </button>
         </div>
 
         {scanError && (
-          <div className="mt-3 p-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700">{scanError}</div>
+          <div role="alert" className="mt-3 p-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700 font-medium">
+            {scanError}
+          </div>
         )}
 
         <div className="mt-5 grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left: Camera / Crop Canvas */}
           <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex flex-col justify-between">
             {sourceMode === 'camera' && cameraActive ? (
               <div className="space-y-3">
@@ -376,43 +405,44 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
                 <button
                   type="button"
                   onClick={captureFromCamera}
-                  className="w-full py-3 rounded-xl bg-orange-500 hover:bg-orange-600 text-white font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
+                  className="w-full py-3 rounded-xl bg-orange-600 hover:bg-orange-700 text-white font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
                 >
-                  <Camera className="w-4 h-4" />
+                  <Camera className="w-4 h-4" aria-hidden="true" />
                   <span>Chụp bức ảnh này</span>
                 </button>
               </div>
             ) : !rawImageUrl ? (
               <label className="border-2 border-dashed border-slate-300 hover:border-sky-400 rounded-2xl p-8 flex flex-col items-center justify-center text-center cursor-pointer min-h-[260px] bg-white">
-                <Upload className="w-10 h-10 text-sky-600 mb-3" />
+                <Upload className="w-10 h-10 text-sky-600 mb-3" aria-hidden="true" />
                 <span className="font-bold text-slate-800 text-sm">Chọn ảnh đề bài từ máy tính hoặc điện thoại</span>
-                <span className="text-xs text-slate-500 mt-1">Hỗ trợ ảnh chụp vở viết tay, sách giáo khoa, bảng hoặc sơ đồ</span>
-                <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+                <span className="text-xs text-slate-600 mt-1">Hỗ trợ ảnh chụp vở viết tay, sách giáo khoa, bảng hoặc sơ đồ</span>
+                <input type="file" accept="image/*" onChange={handleFileChange} className="sr-only" />
               </label>
             ) : (
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-semibold text-slate-600 flex items-center gap-1.5">
-                    <Crop className="w-3.5 h-3.5 text-sky-600" />
+                    <Crop className="w-3.5 h-3.5 text-sky-600" aria-hidden="true" />
                     Kéo chuột trên ảnh để cắt đúng vùng đề bài
                   </span>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
                       onClick={resetCrop}
-                      className="text-xs font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1 cursor-pointer"
+                      className="text-xs font-semibold text-slate-700 hover:text-slate-900 flex items-center gap-1 cursor-pointer"
                     >
-                      <RefreshCw className="w-3 h-3" />
+                      <RefreshCw className="w-3 h-3" aria-hidden="true" />
                       <span>Ảnh gốc</span>
                     </button>
                     <label className="text-xs font-semibold text-sky-700 hover:text-sky-900 cursor-pointer">
                       Đổi ảnh
-                      <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+                      <input type="file" accept="image/*" onChange={handleFileChange} className="sr-only" />
                     </label>
                   </div>
                 </div>
                 <canvas
                   ref={canvasRef}
+                  aria-label="Khung ảnh cắt vùng đề bài"
                   onPointerDown={handlePointerDown}
                   onPointerMove={handlePointerMove}
                   onPointerUp={handlePointerUp}
@@ -424,28 +454,28 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
                   onClick={runScan}
                   className="mt-3 w-full py-3 rounded-xl bg-sky-600 hover:bg-sky-700 disabled:opacity-60 text-white font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
                 >
-                  <ScanSearch className="w-4 h-4" />
+                  <ScanSearch className="w-4 h-4" aria-hidden="true" />
                   <span>{scanning ? 'SOCO đang đọc đề bài...' : 'Nhận dạng nội dung bằng Gemini Vision'}</span>
                 </button>
               </div>
             )}
           </div>
 
-          {/* Right: Preview + Editable OCR Confirmation */}
           <div className="bg-white border border-slate-200 rounded-2xl p-4 flex flex-col justify-between">
             {!ocrReady ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-500">
-                <ScanSearch className="w-10 h-10 text-slate-300 mb-3" />
-                <p className="text-sm font-semibold text-slate-700">Xem trước & Xác nhận nội dung</p>
+              <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-600">
+                <ScanSearch className="w-10 h-10 text-slate-300 mb-3" aria-hidden="true" />
+                <p className="text-sm font-semibold text-slate-800">Xem trước &amp; Xác nhận nội dung</p>
                 <p className="text-xs mt-1 leading-relaxed max-w-xs">
                   Sau khi nhấn nhận dạng, em có thể kiểm tra và sửa lại những chữ hoặc phép tính bị mờ trước khi bắt đầu học cùng SOCO.
                 </p>
                 {croppedDataUrl && cropRect && (
                   <div className="mt-4 w-full">
-                    <div className="text-[11px] font-semibold text-slate-500 mb-1">Vùng ảnh đã cắt:</div>
+                    <div className="text-[11px] font-semibold text-slate-600 mb-1">Vùng ảnh đã cắt:</div>
                     <img
                       src={croppedDataUrl}
-                      alt="Vùng đề bài đã cắt"
+                      alt="Vùng đề bài đã cắt để nhận dạng"
+                      decoding="async"
                       className="max-h-32 mx-auto rounded-lg border border-slate-200"
                     />
                   </div>
@@ -454,24 +484,27 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
             ) : (
               <div className="space-y-3">
                 {!isReadable ? (
-                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-start gap-2">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-xs flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" aria-hidden="true" />
                     <div>
                       <div className="font-bold">Ảnh chưa đủ rõ để đọc chính xác</div>
                       <p className="mt-0.5">{readabilityFeedback || 'Em hãy chụp lại rõ nét hơn hoặc gõ trực tiếp đề bài bên dưới nhé.'}</p>
                     </div>
                   </div>
                 ) : (
-                  <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2 font-semibold">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-center gap-2 font-semibold">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" aria-hidden="true" />
                     <span>Đã nhận dạng xong! Em kiểm tra và chỉnh sửa nếu cần nhé.</span>
                   </div>
                 )}
 
                 <div className="grid grid-cols-2 gap-2.5">
                   <div>
-                    <label className="block text-xs font-semibold text-slate-600 mb-1">Môn học</label>
+                    <label htmlFor="ocr-subject" className="block text-xs font-semibold text-slate-700 mb-1">
+                      Môn học
+                    </label>
                     <input
+                      id="ocr-subject"
                       type="text"
                       value={detectedSubject}
                       onChange={(e) => setDetectedSubject(e.target.value)}
@@ -479,8 +512,11 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-slate-600 mb-1">Lớp học</label>
+                    <label htmlFor="ocr-grade" className="block text-xs font-semibold text-slate-700 mb-1">
+                      Lớp học
+                    </label>
                     <select
+                      id="ocr-grade"
                       value={detectedGrade}
                       onChange={(e) => setDetectedGrade(Number(e.target.value))}
                       className="w-full px-3 py-2 rounded-xl border border-slate-300 text-xs font-semibold bg-white"
@@ -495,8 +531,11 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Nội dung đề bài (có thể chỉnh sửa)</label>
+                  <label htmlFor="ocr-extracted-text" className="block text-xs font-semibold text-slate-700 mb-1">
+                    Nội dung đề bài (có thể chỉnh sửa)
+                  </label>
                   <textarea
+                    id="ocr-extracted-text"
                     rows={5}
                     value={extractedText}
                     onChange={(e) => setExtractedText(e.target.value)}
@@ -518,9 +557,9 @@ export function ProblemScannerModal({ isOpen, defaultGrade = 4, onClose, onConfi
                     });
                     onClose();
                   }}
-                  className="w-full py-3 rounded-xl bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white font-bold text-sm cursor-pointer"
+                  className="w-full py-3 rounded-xl bg-orange-600 hover:bg-orange-700 disabled:opacity-50 text-white font-bold text-sm cursor-pointer"
                 >
-                  Xác nhận đề bài & Học cùng SOCO
+                  Xác nhận đề bài &amp; Học cùng SOCO
                 </button>
               </div>
             )}

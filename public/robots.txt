@@ -1,0 +1,19 @@
+User-agent: *
+Allow: /
+Allow: /dang-nhap
+Allow: /dang-ky
+Allow: /chinh-sach-bao-mat
+Allow: /dieu-khoan-su-dung
+Allow: /chinh-sach-du-lieu-tre-em
+Allow: /lien-he
+Disallow: /api/
+Disallow: /hoc
+Disallow: /gia-su
+Disallow: /kho-tri-thuc
+Disallow: /tro-choi
+Disallow: /thanh-tich
+Disallow: /giao-vien
+Disallow: /phu-huynh
+Disallow: /quan-tri
+
+Sitemap: /sitemap.xml

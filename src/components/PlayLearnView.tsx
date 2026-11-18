@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeft, CheckCircle2, Gamepad2, RefreshCw, Sparkles, XCircle } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, Gamepad2, RefreshCw, Sparkles, Volume2, XCircle } from 'lucide-react';
 import { apiRequest, UserProfileData } from '../lib/api';
+import { resolveAssetUrl } from '../lib/assets';
+import { useGradeMode } from '../lib/gradeMode';
 
 type GameType =
   | 'quiz'
@@ -55,12 +57,13 @@ interface PlayLearnViewProps {
 }
 
 export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLearnViewProps) {
+  const { isGrade12Mode, speechSupported, speakVietnamese } = useGradeMode();
+
   const [games, setGames] = useState<GameExercise[]>([]);
   const [filterType, setFilterType] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [activeGame, setActiveGame] = useState<GameExercise | null>(null);
 
-  // Active gameplay states
   const [qIndex, setQIndex] = useState(0);
   const [correctCount, setCorrectCount] = useState(0);
   const [wrongTopics, setWrongTopics] = useState<string[]>([]);
@@ -68,7 +71,6 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
   const [finishedScore, setFinishedScore] = useState<number | null>(null);
   const [startTime, setStartTime] = useState<number>(Date.now());
 
-  // Specific mechanics states
   const [textInput, setTextInput] = useState('');
   const [selectedLeft, setSelectedLeft] = useState<string | null>(null);
   const [matchedPairs, setMatchedPairs] = useState<Record<string, string>>({});
@@ -172,7 +174,6 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
     }
   }
 
-  // Memory card flip handler
   function handleFlipMemory(idx: number) {
     if (flippedIndices.length >= 2 || memoryCards[idx].matched || flippedIndices.includes(idx)) return;
     const next = [...flippedIndices, idx];
@@ -204,12 +205,12 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
           <button
             type="button"
             onClick={() => setActiveGame(null)}
-            className="text-sm font-bold text-slate-600 hover:text-slate-900 flex items-center gap-1.5 cursor-pointer"
+            className="text-sm font-bold text-slate-700 hover:text-slate-900 flex items-center gap-1.5 cursor-pointer"
           >
-            <ArrowLeft className="w-4 h-4" />
+            <ArrowLeft className="w-4 h-4" aria-hidden="true" />
             <span>Quay lại danh sách</span>
           </button>
-          <div className="text-xs font-bold text-sky-700 tabular-nums">
+          <div className="text-xs font-bold text-sky-800 tabular-nums">
             {GAME_TYPE_LABELS[activeGame.game_type]} · Câu {Math.min(qIndex + 1, activeGame.questions.length)}/{activeGame.questions.length}
           </div>
         </div>
@@ -217,22 +218,22 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
         {finishedScore !== null ? (
           <div className="py-8 text-center space-y-4">
             <div className="w-16 h-16 rounded-2xl bg-amber-100 text-amber-700 mx-auto flex items-center justify-center">
-              <Sparkles className="w-8 h-8" />
+              <Sparkles className="w-8 h-8" aria-hidden="true" />
             </div>
             <h2 className="font-display text-2xl font-extrabold text-slate-900">
               Hoàn thành trò chơi: {activeGame.title}
             </h2>
             <p className="text-base text-slate-700 tabular-nums">
-              Kết quả của em: <strong className="text-sky-700">{finishedScore}%</strong> ({correctCount}/{activeGame.questions.length} lượt đúng)
+              Kết quả của em: <strong className="text-sky-800">{finishedScore}%</strong> ({correctCount}/{activeGame.questions.length} lượt đúng)
             </p>
-            <p className="text-xs text-slate-500">Điểm kinh nghiệm (XP) và hồ sơ năng lực đã được lưu vào hệ thống.</p>
+            <p className="text-xs text-slate-600">Điểm kinh nghiệm (XP) và hồ sơ năng lực đã được lưu vào hệ thống.</p>
             <div className="flex justify-center gap-3 pt-2">
               <button
                 type="button"
                 onClick={() => startGame(activeGame)}
                 className="px-5 py-2.5 rounded-xl border border-slate-300 font-bold text-sm flex items-center gap-2 cursor-pointer"
               >
-                <RefreshCw className="w-4 h-4" />
+                <RefreshCw className="w-4 h-4" aria-hidden="true" />
                 <span>Chơi lại</span>
               </button>
               <button
@@ -246,10 +247,23 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
           </div>
         ) : q ? (
           <div className="space-y-5">
-            <h2 className="font-display text-xl font-extrabold text-slate-900">{activeGame.title}</h2>
-            <p className="text-base font-semibold text-slate-800 leading-relaxed">{q.prompt}</p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="font-display text-xl font-extrabold text-slate-900">{activeGame.title}</h2>
+              {speechSupported && (
+                <button
+                  type="button"
+                  onClick={() => speakVietnamese(q.prompt)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-xs font-bold text-slate-800 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>Đọc câu hỏi</span>
+                </button>
+              )}
+            </div>
+            <p className={`font-semibold text-slate-800 leading-relaxed ${isGrade12Mode ? 'text-lg' : 'text-base'}`}>
+              {q.prompt}
+            </p>
 
-            {/* 1. Quiz / True-False / Fill Blank with options */}
             {(activeGame.game_type === 'quiz' ||
               activeGame.game_type === 'true_false' ||
               activeGame.game_type === 'fill_blank') &&
@@ -269,10 +283,13 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
                 </div>
               )}
 
-            {/* 2. Math Challenge (direct numeric/text answer) */}
             {activeGame.game_type === 'math_challenge' && (
               <div className="flex gap-3">
+                <label htmlFor="math-challenge-input" className="sr-only">
+                  Đáp số toán học
+                </label>
                 <input
+                  id="math-challenge-input"
                   type="text"
                   value={textInput}
                   disabled={Boolean(feedback)}
@@ -291,12 +308,11 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 3. Matching */}
             {activeGame.game_type === 'matching' && Array.isArray(q.options) && (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <div className="text-xs font-bold text-slate-500">Cột A (Chọn một ô)</div>
+                    <div className="text-xs font-bold text-slate-600">Cột A (Chọn một ô)</div>
                     {(q.options as Array<{ left: string; right: string }>).map((pair) => (
                       <button
                         key={pair.left}
@@ -315,7 +331,7 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
                     ))}
                   </div>
                   <div className="space-y-2">
-                    <div className="text-xs font-bold text-slate-500">Cột B (Ghép cặp)</div>
+                    <div className="text-xs font-bold text-slate-600">Cột B (Ghép cặp)</div>
                     {(q.options as Array<{ left: string; right: string }>).map((pair) => (
                       <button
                         key={pair.right}
@@ -348,10 +364,9 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 4. Drag & Drop Ordering */}
             {activeGame.game_type === 'drag_drop' && (
               <div className="space-y-3">
-                <p className="text-xs text-slate-500">Nhấn mũi tên Lên / Xuống để sắp xếp đúng thứ tự:</p>
+                <p className="text-xs text-slate-600">Nhấn nút Lên / Xuống để sắp xếp đúng thứ tự:</p>
                 {dragOrder.map((item, idx) => (
                   <div key={item} className="flex items-center justify-between gap-3 p-3.5 rounded-2xl bg-slate-50 border border-slate-200">
                     <span className="text-sm font-bold text-slate-800">
@@ -401,12 +416,11 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 5. Word Puzzle */}
             {activeGame.game_type === 'word_puzzle' && (
               <div className="space-y-4">
                 <div className="p-4 rounded-2xl bg-sky-50 border border-sky-200 min-h-[56px] flex flex-wrap gap-2 items-center">
                   {pickedLetters.length === 0 ? (
-                    <span className="text-xs text-slate-500">Nhấn các chữ cái bên dưới để ghép từ...</span>
+                    <span className="text-xs text-slate-600">Nhấn các chữ cái bên dưới để ghép từ...</span>
                   ) : (
                     pickedLetters.map((idx, pos) => (
                       <button
@@ -448,13 +462,13 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 6. Picture Recognition */}
             {activeGame.game_type === 'picture_recognition' && typeof q.options === 'object' && q.options !== null && (
               <div className="space-y-4">
                 <img
-                  src={(q.options as { imageUrl: string }).imageUrl}
-                  alt="Hình minh họa câu hỏi"
-                  referrerPolicy="no-referrer"
+                  src={resolveAssetUrl((q.options as { imageUrl: string }).imageUrl)}
+                  alt={`Hình minh họa câu hỏi: ${q.prompt}`}
+                  loading="lazy"
+                  decoding="async"
                   className="w-full max-h-64 object-cover rounded-2xl border border-slate-200"
                 />
                 <div className="space-y-2">
@@ -473,7 +487,6 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 7. Memory Game */}
             {activeGame.game_type === 'memory' && (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 {memoryCards.map((card, idx) => {
@@ -482,10 +495,11 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
                     <button
                       key={card.uid}
                       type="button"
+                      aria-label={revealed ? card.text : `Lật thẻ số ${idx + 1}`}
                       onClick={() => handleFlipMemory(idx)}
                       className={`h-24 rounded-2xl border p-2 text-xs font-extrabold transition-colors cursor-pointer ${
                         card.matched
-                          ? 'bg-emerald-50 border-emerald-400 text-emerald-900'
+                          ? 'bg-emerald-50 border-emerald-400 text-emerald-950'
                           : revealed
                           ? 'bg-sky-50 border-sky-500 text-sky-950'
                           : 'bg-slate-800 border-slate-900 text-white hover:bg-slate-700'
@@ -498,7 +512,6 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
               </div>
             )}
 
-            {/* 8. Interactive Story */}
             {activeGame.game_type === 'interactive_story' && Array.isArray(q.options) && (
               <div className="space-y-2.5">
                 {(q.options as Array<{ text: string; isBest: boolean; feedback: string }>).map((branch) => (
@@ -517,15 +530,16 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
 
             {feedback && (
               <div
+                role="status"
                 className={`p-4 rounded-2xl border flex items-start justify-between gap-4 ${
                   feedback.ok ? 'bg-emerald-50 border-emerald-300 text-emerald-950' : 'bg-amber-50 border-amber-300 text-amber-950'
                 }`}
               >
                 <div className="flex items-start gap-2.5 text-sm">
                   {feedback.ok ? (
-                    <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                    <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" aria-hidden="true" />
                   ) : (
-                    <XCircle className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                    <XCircle className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" aria-hidden="true" />
                   )}
                   <span>{feedback.text}</span>
                 </div>
@@ -549,23 +563,29 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
       <section className="bg-white border border-slate-200 rounded-3xl p-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="font-display text-2xl font-extrabold text-slate-900">Play & Learn — Vừa chơi vừa học</h1>
-            <p className="text-xs text-slate-500 mt-0.5">
-              10 dạng trò chơi tư duy tương tác phù hợp Lớp {user.profile?.grade_level || 4} · Tự động chấm điểm & tích lũy XP
+            <h1 className="font-display text-2xl font-extrabold text-slate-900">Play &amp; Learn — Vừa chơi vừa học</h1>
+            <p className="text-xs text-slate-600 mt-0.5">
+              10 dạng trò chơi tư duy tương tác phù hợp Lớp {user.profile?.grade_level || 4} · Tự động chấm điểm &amp; tích lũy XP
             </p>
           </div>
-          <select
-            value={filterType}
-            onChange={(e) => setFilterType(e.target.value)}
-            className="px-3.5 py-2 rounded-xl border border-slate-300 text-xs font-bold bg-white"
-          >
-            <option value="">Tất cả 10 thể loại trò chơi</option>
-            {Object.entries(GAME_TYPE_LABELS).map(([k, label]) => (
-              <option key={k} value={k}>
-                {label}
-              </option>
-            ))}
-          </select>
+          <div>
+            <label htmlFor="game-type-filter" className="sr-only">
+              Lọc theo thể loại trò chơi
+            </label>
+            <select
+              id="game-type-filter"
+              value={filterType}
+              onChange={(e) => setFilterType(e.target.value)}
+              className="px-3.5 py-2 rounded-xl border border-slate-300 text-xs font-bold bg-white"
+            >
+              <option value="">Tất cả 10 thể loại trò chơi</option>
+              {Object.entries(GAME_TYPE_LABELS).map(([k, label]) => (
+                <option key={k} value={k}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
       </section>
 
@@ -580,11 +600,11 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
           {games.map((g) => (
             <div key={g.id} className="bg-white border border-slate-200 rounded-3xl p-5 flex flex-col justify-between">
               <div>
-                <div className="text-xs font-semibold text-sky-700">
+                <div className="text-xs font-semibold text-sky-800">
                   {GAME_TYPE_LABELS[g.game_type]} · {g.subject_name} · {g.grade_name}
                 </div>
-                <h3 className="font-display text-lg font-extrabold text-slate-900 mt-1.5">{g.title}</h3>
-                <p className="text-xs text-slate-500 mt-2 tabular-nums">
+                <h2 className="font-display text-lg font-extrabold text-slate-900 mt-1.5">{g.title}</h2>
+                <p className="text-xs text-slate-600 mt-2 tabular-nums">
                   {g.questions.length} thử thách · Thưởng tối đa +{g.xp_reward} XP
                 </p>
               </div>
@@ -593,7 +613,7 @@ export function PlayLearnView({ user, initialSubjectId, onUserUpdated }: PlayLea
                 onClick={() => startGame(g)}
                 className="mt-5 w-full py-2.5 px-4 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
               >
-                <Gamepad2 className="w-4 h-4" />
+                <Gamepad2 className="w-4 h-4" aria-hidden="true" />
                 <span>Chơi ngay</span>
               </button>
             </div>

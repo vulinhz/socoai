@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { seedGdpt2018Curriculum } from './curriculum_gdpt2018.ts';
 
 function resolveWritableDbPath(): string {
   if (process.env.DATABASE_PATH) {
@@ -421,11 +422,68 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_assignments_class ON teacher_assignments(class_id);
     CREATE INDEX IF NOT EXISTS idx_ai_logs_user_date ON ai_usage_logs(user_id, created_at);
   `);
+
+  // Safe migrations for existing SQLite databases
+  const ensureColumn = (table: string, col: string, definition: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === col)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${definition}`);
+    }
+  };
+
+  ensureColumn('users', 'accepted_terms_at', 'TEXT');
+  ensureColumn('lessons', 'review_status', `TEXT NOT NULL DEFAULT 'published'`);
+  ensureColumn('lessons', 'is_ai_generated', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('exercises', 'review_status', `TEXT NOT NULL DEFAULT 'published'`);
+  ensureColumn('exercises', 'is_ai_generated', 'INTEGER NOT NULL DEFAULT 0');
+
+  db.exec(`
+    UPDATE lessons
+    SET review_status = CASE WHEN status = 'draft' THEN 'draft' ELSE 'published' END
+    WHERE review_status IS NULL OR review_status = '';
+  `);
+}
+
+export function cleanupExpiredConversations(): { deletedCount: number; retentionDays: number } {
+  const row = db
+    .prepare(`SELECT value FROM system_settings WHERE key = 'conversation_retention_days'`)
+    .get() as { value: string } | undefined;
+  const retentionDays = Math.min(3650, Math.max(1, Number(row?.value) || 90));
+  const res = db
+    .prepare(
+      `DELETE FROM tutoring_sessions
+       WHERE datetime(updated_at) < datetime('now', '-' || ? || ' days')`
+    )
+    .run(retentionDays);
+  return { deletedCount: res.changes, retentionDays };
 }
 
 export function seedDatabase() {
   const existingGrades = db.prepare('SELECT COUNT(*) as cnt FROM grades').get() as { cnt: number };
-  if (existingGrades.cnt > 0) return;
+  if (existingGrades.cnt > 0) {
+    // Upgrade existing DBs cleanly with WebP asset paths, retention setting & full GDPT 2018 curriculum
+    db.exec(`
+      UPDATE lessons SET illustration_url = '/src/assets/images/lesson_math_fractions.webp' WHERE illustration_url LIKE '%lesson_math_fractions%';
+      UPDATE lessons SET illustration_url = '/src/assets/images/lesson_vietnamese_story.webp' WHERE illustration_url LIKE '%lesson_vietnamese_story%';
+      UPDATE lessons SET illustration_url = '/src/assets/images/lesson_science_nature.webp' WHERE illustration_url LIKE '%lesson_science_nature%';
+      UPDATE lessons SET illustration_url = '/src/assets/images/hero_learning_world.webp' WHERE illustration_url LIKE '%hero_learning_world%';
+      UPDATE exercise_questions SET options_json = REPLACE(options_json, 'lesson_science_nature_1794794875281.jpg', 'lesson_science_nature.webp')
+      WHERE options_json LIKE '%lesson_science_nature_1794794875281.jpg%';
+    `);
+    db.prepare(
+      `INSERT OR IGNORE INTO system_settings (key, value, description) VALUES (?, ?, ?)`
+    ).run(
+      'conversation_retention_days',
+      '90',
+      'Số ngày lưu trữ tối đa cho lịch sử hội thoại gia sư AI trước khi tự động xóa theo chính sách dữ liệu trẻ em.'
+    );
+    const existingTeacher = db.prepare(`SELECT id FROM users WHERE role = 'teacher' ORDER BY id ASC LIMIT 1`).get() as
+      | { id: number }
+      | undefined;
+    seedGdpt2018Curriculum(db, existingTeacher?.id ?? null);
+    cleanupExpiredConversations();
+    return;
+  }
 
   const insertGrade = db.prepare('INSERT INTO grades (level, name, description) VALUES (?, ?, ?)');
   const gradesData = [
@@ -507,7 +565,7 @@ export function seedDatabase() {
     'Phép cộng trong phạm vi 10 cùng những viên bi',
     'Biết gộp hai nhóm đồ vật để tìm tổng số lượng trong phạm vi 10.',
     'Khi gộp 2 nhóm đồ vật lại với nhau, ta dùng phép cộng (+). Ví dụ: có 3 quả táo và thêm 2 quả táo, đếm tất cả được 5 quả táo: 3 + 2 = 5.',
-    '/src/assets/images/lesson_math_fractions_1794794875088.jpg',
+    '/src/assets/images/lesson_math_fractions.webp',
     JSON.stringify(['Lan có 4 bút chì màu, mẹ cho thêm 3 bút chì màu nữa. Lan có tất cả 4 + 3 = 7 bút chì màu.', 'Trên cành có 5 chú chim, bay tới thêm 2 chú chim. Tất cả có 5 + 2 = 7 chú chim.']),
     JSON.stringify({ question: 'Trong giỏ có 4 quả cam, bé bỏ thêm 2 quả cam. Hỏi có tất cả mấy quả cam?', options: ['5 quả cam', '6 quả cam', '7 quả cam'], answer: '6 quả cam', hint: 'Em hãy đếm tiếp từ 4 thêm 2 bước nhé: 4 -> 5 -> ...' }),
     'Nhớ đếm kỹ từng nhóm trước khi gộp lại nhé!',
@@ -521,7 +579,7 @@ export function seedDatabase() {
     'Phép cộng có nhớ dạng 28 + 15',
     'Hiểu bản chất gộp 10 đơn vị thành 1 chục khi cộng các số có hai chữ số.',
     'Khi cộng hàng đơn vị: 8 + 5 = 13, viết 3 ở hàng đơn vị và nhớ 1 chục sang hàng chục. Sau đó cộng hàng chục: 2 + 1 + 1 (nhớ) = 4. Kết quả là 43.',
-    '/src/assets/images/lesson_math_fractions_1794794875088.jpg',
+    '/src/assets/images/lesson_math_fractions.webp',
     JSON.stringify(['27 + 16: 7 + 6 = 13 (viết 3 nhớ 1); 2 + 1 + 1 = 4 -> 43.', '39 + 24: 9 + 4 = 13 (viết 3 nhớ 1); 3 + 2 + 1 = 6 -> 63.']),
     JSON.stringify({ question: 'Kết quả của 26 + 17 là bao nhiêu?', options: ['33', '43', '42'], answer: '43', hint: '6 + 7 = 13, viết 3 nhớ 1 sang hàng chục (2 + 1 + 1).' }),
     'Luôn đặt chữ số hàng đơn vị thẳng cột với hàng đơn vị!',
@@ -535,7 +593,7 @@ export function seedDatabase() {
     'Chu vi hình chữ nhật và hình vuông',
     'Biết tính tổng độ dài các cạnh bao quanh hình chữ nhật và hình vuông.',
     'Chu vi là tổng độ dài đường bao quanh hình. Hình chữ nhật có 2 chiều dài và 2 chiều rộng nên Chu vi = (Chiều dài + Chiều rộng) × 2 (cùng đơn vị đo).',
-    '/src/assets/images/lesson_math_fractions_1794794875088.jpg',
+    '/src/assets/images/lesson_math_fractions.webp',
     JSON.stringify(['Mảnh vườn hình chữ nhật dài 8m, rộng 5m. Chu vi = (8 + 5) × 2 = 26m.', 'Khung ảnh hình vuông cạnh 6cm. Chu vi = 6 × 4 = 24cm.']),
     JSON.stringify({ question: 'Quyển vở hình chữ nhật dài 20cm, rộng 15cm. Chu vi quyển vở là:', options: ['35 cm', '70 cm', '300 cm'], answer: '70 cm', hint: 'Em nhớ cộng chiều dài và chiều rộng rồi nhân với 2 nhé!' }),
     'Kiểm tra xem chiều dài và chiều rộng đã cùng đơn vị đo chưa trước khi tính.',
@@ -549,7 +607,7 @@ export function seedDatabase() {
     'Khái niệm Phân số và Quy đồng mẫu số',
     'Hiểu tử số, mẫu số qua hình ảnh chia bánh và biết cách quy đồng hai phân số khác mẫu.',
     'Phân số gồm tử số (ở trên) và mẫu số (ở dưới, khác 0). Mẫu số cho biết một cái bánh được chia làm mấy phần bằng nhau; tử số cho biết ta lấy bao nhiêu phần như thế. Khi cộng hai phân số khác mẫu, ta cần đưa chúng về cùng một kích thước phần (quy đồng mẫu số).',
-    '/src/assets/images/lesson_math_fractions_1794794875088.jpg',
+    '/src/assets/images/lesson_math_fractions.webp',
     JSON.stringify(['Chia chiếc bánh pizza thành 4 phần bằng nhau, lấy 3 phần ta có phân số 3/4.', 'Quy đồng 1/2 và 1/3 về mẫu số chung 6: 1/2 = 3/6 và 1/3 = 2/6.']),
     JSON.stringify({ question: 'Vì sao trước khi cộng 1/2 + 1/3 ta phải quy đồng mẫu số?', options: ['Để hai phân số có cùng kích thước phần bằng nhau', 'Để tử số lớn hơn mẫu số', 'Để bỏ mẫu số đi'], answer: 'Để hai phân số có cùng kích thước phần bằng nhau', hint: 'Hãy tưởng tượng 1/2 chiếc bánh và 1/3 chiếc bánh có kích thước miếng khác nhau.' }),
     'Nhân cả tử số và mẫu số với cùng một số tự nhiên khác 0 thì giá trị phân số không đổi.',
@@ -563,7 +621,7 @@ export function seedDatabase() {
     'Biện pháp Nhân hóa trong văn miêu tả',
     'Nhận ra cách gọi, tả sự vật bằng từ ngữ vốn dùng cho con người để câu văn sinh động.',
     'Nhân hóa là cách gọi hoặc tả con vật, cây cối, đồ vật bằng những từ ngữ dùng để gọi hoặc tả con người (ví dụ: chị Ong nâu, bác Trống trường, cây bàng dang tay che nắng).',
-    '/src/assets/images/lesson_vietnamese_story_1794794876639.jpg',
+    '/src/assets/images/lesson_vietnamese_story.webp',
     JSON.stringify(['"Ông mặt trời thức dậy từ sớm, rải nắng vàng xuống sân trường." -> Dùng từ "Ông", "thức dậy" như con người.', '"Chú chuồn chuồn nước tung tăng lướt trên mặt hồ."']),
     JSON.stringify({ question: 'Câu nào sau đây có sử dụng biện pháp nhân hóa?', options: ['Bông hoa cúc màu vàng tươi.', 'Chị gió nhẹ nhàng ru hàng tre ngủ.', 'Sân trường em rất rộng rãi.'], answer: 'Chị gió nhẹ nhàng ru hàng tre ngủ.', hint: 'Tìm câu có từ xưng hô hoặc hành động giống con người như "chị", "ru ngủ".' }),
     'Thử tự đặt một câu nhân hóa về chiếc cặp sách hoặc cây bút của em nhé!',
@@ -577,7 +635,7 @@ export function seedDatabase() {
     'Vòng tuần hoàn của nước và Sự sống của cây xanh',
     'Giải thích được quá trình bay hơi, ngưng tụ tạo mây, mưa và vai trò của rễ, thân, lá cây.',
     'Dưới ánh nắng mặt trời, nước từ sông, hồ bay hơi lên cao, gặp lạnh ngưng tụ thành mây và rơi xuống thành mưa. Cây xanh hút nước và muối khoáng qua rễ, dẫn qua thân lên lá để quang hợp.',
-    '/src/assets/images/lesson_science_nature_1794794875281.jpg',
+    '/src/assets/images/lesson_science_nature.webp',
     JSON.stringify(['Khi phơi quần áo ướt dưới nắng, nước chuyển từ thể lỏng sang thể hơi (bay hơi).', 'Lá cây cần ánh sáng mặt trời, khí các-bô-níc và nước để tạo ra chất dinh dưỡng.']),
     JSON.stringify({ question: 'Bộ phận nào của cây có nhiệm vụ chính hút nước và muối khoáng từ đất?', options: ['Lá cây', 'Rễ cây', 'Hoa'], answer: 'Rễ cây', hint: 'Bộ phận nằm dưới lòng đất và lan rộng như mạng lưới.' }),
     'Tiết kiệm nước sạch mỗi ngày chính là bảo vệ vòng tuần hoàn sự sống!',
@@ -591,7 +649,7 @@ export function seedDatabase() {
     'Khái niệm Số thập phân và Giá trị hàng',
     'Đọc, viết số thập phân và phân biệt phần nguyên với phần thập phân.',
     'Mỗi số thập phân gồm hai phần: phần nguyên và phần thập phân, ngăn cách bởi dấu phẩy. Ví dụ: 3,45 gồm 3 đơn vị, 4 phần mười và 5 phần trăm.',
-    '/src/assets/images/lesson_math_fractions_1794794875088.jpg',
+    '/src/assets/images/lesson_math_fractions.webp',
     JSON.stringify(['25/100 mét = 0,25 mét.', '1,5 giờ nghĩa là 1 giờ và 5/10 giờ (tức 1 giờ 30 phút).']),
     JSON.stringify({ question: 'Trong số 14,72, chữ số 7 nằm ở hàng nào?', options: ['Hàng chục', 'Hàng phần mười', 'Hàng phần trăm'], answer: 'Hàng phần mười', hint: 'Chữ số đầu tiên ngay bên phải dấu phẩy là hàng phần mười.' }),
     'Viết dấu phẩy thẳng cột khi cộng hoặc trừ các số thập phân!',
@@ -605,7 +663,7 @@ export function seedDatabase() {
     'Talking about Daily Activities & Time',
     'Biết hỏi giờ và kể hoạt động hàng ngày: get up, have breakfast, go to school.',
     'Để hỏi giờ: "What time is it?" - "It is six thirty." Để nói thói quen: "I get up at six o’clock."',
-    '/src/assets/images/hero_learning_world_1794794874331.jpg',
+    '/src/assets/images/hero_learning_world.webp',
     JSON.stringify(['"What time do you go to school?" -> "I go to school at seven o’clock."', '"I like reading science books after school."']),
     JSON.stringify({ question: 'Chọn câu trả lời đúng cho "What time do you get up?"', options: ['I get up at six o’clock.', 'I am nine years old.', 'It is a blue pen.'], answer: 'I get up at six o’clock.', hint: 'Câu hỏi về thời gian ("What time") thường trả lời kèm "at + giờ".' }),
     'Luyện nói to trước gương 3 câu về buổi sáng của em nhé!',
@@ -706,7 +764,7 @@ export function seedDatabase() {
     exPic,
     'picture_recognition',
     'Quan sát bức tranh sơ đồ cây xanh và kính lúp: Mũi tên xanh đi lên từ rễ lên lá thể hiện điều gì?',
-    JSON.stringify({ imageUrl: '/src/assets/images/lesson_science_nature_1794794875281.jpg', choices: ['Nước và khoáng chất được rễ hút đưa lên nuôi cây', 'Cây đang rụng lá vào mùa đông', 'Ánh sáng đi xuống lòng đất'] }),
+    JSON.stringify({ imageUrl: '/src/assets/images/lesson_science_nature.webp', choices: ['Nước và khoáng chất được rễ hút đưa lên nuôi cây', 'Cây đang rụng lá vào mùa đông', 'Ánh sáng đi xuống lòng đất'] }),
     'Nước và khoáng chất được rễ hút đưa lên nuôi cây',
     'Rễ cây hút nước từ đất và vận chuyển qua mạch gỗ trong thân lên lá.',
     1
@@ -844,6 +902,11 @@ export function seedDatabase() {
   insertSetting.run('daily_ai_limit_per_student', '40', 'Số lượt tương tác AI tối đa mỗi ngày cho mỗi tài khoản học sinh để đảm bảo học tập lành mạnh.');
   insertSetting.run('safety_filter_enabled', 'true', 'Bật kiểm duyệt an toàn nội dung giáo dục và hình ảnh tải lên cho trẻ em.');
   insertSetting.run('socratic_strictness', 'high', 'Mức độ giữ nguyên tắc Socratic: không đưa đáp án trực tiếp khi học sinh hỏi bài.');
+  insertSetting.run('conversation_retention_days', '90', 'Số ngày lưu trữ tối đa cho lịch sử hội thoại gia sư AI trước khi tự động xóa theo chính sách dữ liệu trẻ em.');
+
+  // Seed 100 GDPT 2018 Toán & Tiếng Việt lessons across Grades 1–5 + calibrated games
+  seedGdpt2018Curriculum(db, teacherId);
+  cleanupExpiredConversations();
 }
 
 initDatabase();

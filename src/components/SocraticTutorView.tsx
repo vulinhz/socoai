@@ -10,12 +10,16 @@ import {
   Plus,
   Send,
   Sparkles,
+  Square,
   Volume2,
+  WifiOff,
   Zap,
 } from 'lucide-react';
 import { apiRequest, UserProfileData } from '../lib/api';
+import { SpeechRateOption, useGradeMode } from '../lib/gradeMode';
 import { SocoEmotion, SocoMascot } from './SocoMascot';
 import { ProblemScannerModal, ScannedProblemPayload } from './ProblemScannerModal';
+import { useOnlineStatus } from './PwaControls';
 
 type TutorMode = 'socratic' | 'hint' | 'concept' | 'challenge';
 
@@ -67,6 +71,20 @@ export function SocraticTutorView({
   initialTopic,
   autoOpenScanner = false,
 }: SocraticTutorViewProps) {
+  const isOnline = useOnlineStatus();
+  const {
+    isGrade12Mode,
+    toggleGrade12Mode,
+    autoReadEnabled,
+    setAutoReadEnabled,
+    speechRate,
+    setSpeechRate,
+    speechSupported,
+    isSpeaking,
+    speakVietnamese,
+    stopSpeaking,
+  } = useGradeMode();
+
   const [subjects, setSubjects] = useState<Array<{ id: number; name: string }>>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(initialSessionId || null);
@@ -91,17 +109,38 @@ export function SocraticTutorView({
   const [understandingScore, setUnderstandingScore] = useState<number>(3);
   const [similarProblem, setSimilarProblem] = useState<string>('');
 
-  // Voice recognition & speech synthesis
+  // Voice recognition support detection
   const [listening, setListening] = useState(false);
   const recognitionRef = useRef<unknown>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  const voiceSupported =
+    typeof window !== 'undefined' &&
+    Boolean(
+      (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown }).SpeechRecognition ||
+        (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition
+    );
+
   useEffect(() => {
-    apiRequest<{ subjects: Array<{ id: number; name: string }> }>('/api/curriculum/meta').then((d) => {
-      setSubjects(d.subjects);
-    });
+    apiRequest<{ subjects: Array<{ id: number; name: string }> }>('/api/curriculum/meta')
+      .then((d) => {
+        setSubjects(d.subjects);
+      })
+      .catch(() => {});
     loadSessions();
   }, []);
+
+  useEffect(() => {
+    if (initialSubjectId) setSubjectId(initialSubjectId);
+  }, [initialSubjectId]);
+
+  useEffect(() => {
+    if (initialTopic) setTopic(initialTopic);
+  }, [initialTopic]);
+
+  useEffect(() => {
+    if (autoOpenScanner) setScannerOpen(true);
+  }, [autoOpenScanner]);
 
   useEffect(() => {
     if (initialSessionId) {
@@ -153,6 +192,7 @@ export function SocraticTutorView({
   }
 
   function startFreshSession() {
+    stopSpeaking();
     setActiveSessionId(null);
     setMessages([]);
     setProblemText('');
@@ -166,6 +206,11 @@ export function SocraticTutorView({
   async function sendTurn(customText?: string, overrideMode?: TutorMode, overrideHintLevel?: number, revealSolution = false) {
     const textToSend = (customText ?? inputText).trim();
     if (!textToSend || sending) return;
+
+    if (!isOnline || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+      setError('Em đang ngoại tuyến (Offline). Gia sư AI SOCO cần kết nối internet để trả lời, em thử kiểm tra Wi-Fi/4G hoặc đọc bài trong Kho Tri thức nhé!');
+      return;
+    }
 
     const activeMode = overrideMode || mode;
     const activeHint = overrideHintLevel ?? hintLevel;
@@ -242,6 +287,10 @@ export function SocraticTutorView({
       setMessages((prev) => [...prev, socoReply]);
       onUserUpdated(res.user);
       loadSessions();
+
+      if (autoReadEnabled && speechSupported) {
+        speakVietnamese(res.aiResponse.reply);
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'SOCO đang bận một chút, em thử gửi lại nhé!');
       setSocoEmotion('happy');
@@ -264,12 +313,13 @@ export function SocraticTutorView({
   }
 
   function toggleVoiceInput() {
-    const SpeechRec = (window as unknown as { webkitSpeechRecognition?: new () => unknown; SpeechRecognition?: new () => unknown })
-      .SpeechRecognition ||
+    const SpeechRec =
+      (window as unknown as { SpeechRecognition?: new () => unknown; webkitSpeechRecognition?: new () => unknown })
+        .SpeechRecognition ||
       (window as unknown as { webkitSpeechRecognition?: new () => unknown }).webkitSpeechRecognition;
 
     if (!SpeechRec) {
-      setError('Trình duyệt hiện tại chưa hỗ trợ nhập giọng nói. Em hãy gõ hoặc chụp ảnh bài tập nhé!');
+      setError('Trình duyệt hiện tại chưa hỗ trợ nhập giọng nói (SpeechRecognition). Em hãy gõ hoặc chụp ảnh bài tập nhé!');
       return;
     }
 
@@ -300,20 +350,11 @@ export function SocraticTutorView({
     rec.start();
   }
 
-  function speakText(text: string) {
-    if (!('speechSynthesis' in window)) return;
-    window.speechSynthesis.cancel();
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = 'vi-VN';
-    utter.rate = gradeLevel <= 2 ? 0.9 : 1.0;
-    window.speechSynthesis.speak(utter);
-  }
-
   const modeTabs: Array<{ id: TutorMode; label: string; desc: string; icon: React.ReactNode }> = [
-    { id: 'socratic', label: 'Socratic', desc: 'Đặt câu hỏi gợi mở', icon: <Compass className="w-4 h-4" /> },
-    { id: 'hint', label: 'Gợi ý 3 cấp', desc: 'Nhắc kiến thức & phương pháp', icon: <Lightbulb className="w-4 h-4" /> },
-    { id: 'concept', label: 'Giải thích', desc: 'Hiểu bản chất & ví dụ', icon: <HelpCircle className="w-4 h-4" /> },
-    { id: 'challenge', label: 'Thử thách', desc: 'Tạo bài tương tự', icon: <Zap className="w-4 h-4" /> },
+    { id: 'socratic', label: 'Socratic', desc: 'Đặt câu hỏi gợi mở', icon: <Compass className="w-4 h-4" aria-hidden="true" /> },
+    { id: 'hint', label: 'Gợi ý 3 cấp', desc: 'Nhắc kiến thức & phương pháp', icon: <Lightbulb className="w-4 h-4" aria-hidden="true" /> },
+    { id: 'concept', label: 'Giải thích', desc: 'Hiểu bản chất & ví dụ', icon: <HelpCircle className="w-4 h-4" aria-hidden="true" /> },
+    { id: 'challenge', label: 'Thử thách', desc: 'Tạo bài tương tự', icon: <Zap className="w-4 h-4" aria-hidden="true" /> },
   ];
 
   return (
@@ -326,23 +367,26 @@ export function SocraticTutorView({
             onClick={startFreshSession}
             className="w-full py-2.5 px-4 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
           >
-            <Plus className="w-4 h-4" />
+            <Plus className="w-4 h-4" aria-hidden="true" />
             <span>Bài hỏi mới</span>
           </button>
 
           <button
             type="button"
             onClick={() => setScannerOpen(true)}
-            className="w-full py-2.5 px-4 rounded-xl bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-900 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full py-2.5 px-4 rounded-xl bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-950 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
           >
-            <Camera className="w-4 h-4 text-orange-600" />
+            <Camera className="w-4 h-4 text-orange-600" aria-hidden="true" />
             <span>Chụp / Tải ảnh đề bài</span>
           </button>
 
           <div className="pt-2 border-t border-slate-100 space-y-2.5">
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Lớp học (Phân hóa AI)</label>
+              <label htmlFor="tutor-grade-select" className="block text-xs font-semibold text-slate-700 mb-1">
+                Lớp học (Phân hóa AI)
+              </label>
               <select
+                id="tutor-grade-select"
                 value={gradeLevel}
                 onChange={(e) => setGradeLevel(Number(e.target.value))}
                 className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm font-semibold bg-white"
@@ -355,8 +399,11 @@ export function SocraticTutorView({
               </select>
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Môn học</label>
+              <label htmlFor="tutor-subject-select" className="block text-xs font-semibold text-slate-700 mb-1">
+                Môn học
+              </label>
               <select
+                id="tutor-subject-select"
                 value={subjectId}
                 onChange={(e) => setSubjectId(Number(e.target.value))}
                 className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm font-semibold bg-white"
@@ -369,13 +416,73 @@ export function SocraticTutorView({
               </select>
             </div>
           </div>
+
+          {/* Grade 1-2 Mode & Voice Controls */}
+          <div className="pt-2 border-t border-slate-100 space-y-2">
+            <button
+              type="button"
+              aria-pressed={isGrade12Mode}
+              onClick={toggleGrade12Mode}
+              className={`w-full py-2 px-3 rounded-xl border text-xs font-bold flex items-center justify-between cursor-pointer ${
+                isGrade12Mode
+                  ? 'bg-emerald-50 border-emerald-400 text-emerald-950'
+                  : 'bg-slate-50 border-slate-200 text-slate-700'
+              }`}
+            >
+              <span>Chế độ Lớp 1–2 (Chữ to)</span>
+              <span>{isGrade12Mode ? 'Bật' : 'Tắt'}</span>
+            </button>
+
+            {speechSupported && (
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="font-bold text-slate-700">Tự đọc to câu SOCO</span>
+                  <button
+                    type="button"
+                    aria-pressed={autoReadEnabled}
+                    onClick={() => setAutoReadEnabled(!autoReadEnabled)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold cursor-pointer ${
+                      autoReadEnabled ? 'bg-sky-600 text-white' : 'bg-white border border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    {autoReadEnabled ? 'Đang bật' : 'Đang tắt'}
+                  </button>
+                </div>
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <label htmlFor="speech-rate-select" className="font-semibold text-slate-600">
+                    Tốc độ đọc:
+                  </label>
+                  <select
+                    id="speech-rate-select"
+                    value={speechRate}
+                    onChange={(e) => setSpeechRate(Number(e.target.value) as SpeechRateOption)}
+                    className="px-2 py-1 rounded-lg border border-slate-300 bg-white font-bold text-xs"
+                  >
+                    <option value={0.75}>0.75x (Chậm rõ)</option>
+                    <option value={0.9}>0.9x (Vừa phải)</option>
+                    <option value={1.1}>1.1x (Nhanh)</option>
+                  </select>
+                </div>
+                {isSpeaking && (
+                  <button
+                    type="button"
+                    onClick={stopSpeaking}
+                    className="w-full py-1.5 rounded-lg bg-red-50 border border-red-200 text-red-800 text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Square className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Dừng đọc</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* History */}
         <div className="bg-white border border-slate-200 rounded-3xl p-4">
-          <h3 className="font-display text-sm font-extrabold text-slate-900 mb-2.5">Lịch sử hội thoại</h3>
+          <h2 className="font-display text-sm font-extrabold text-slate-900 mb-2.5">Lịch sử hội thoại</h2>
           {sessions.length === 0 ? (
-            <p className="text-xs text-slate-500">Chưa có phiên trò chuyện nào được lưu.</p>
+            <p className="text-xs text-slate-600">Chưa có phiên trò chuyện nào được lưu.</p>
           ) : (
             <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
               {sessions.map((s) => (
@@ -401,17 +508,19 @@ export function SocraticTutorView({
       </aside>
 
       {/* Main Conversation Stage */}
-      <section className="lg:col-span-6 bg-white border border-slate-200 rounded-3xl flex flex-col min-h-[620px] max-h-[760px]">
+      <section className="lg:col-span-6 bg-white border border-slate-200 rounded-3xl flex flex-col min-h-[620px] max-h-[780px]">
         {/* Mode Bar */}
         <div className="p-4 border-b border-slate-100">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-slate-100 p-1 rounded-2xl">
+          <div role="tablist" aria-label="Chế độ học với SOCO" className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-slate-100 p-1 rounded-2xl">
             {modeTabs.map((t) => (
               <button
                 key={t.id}
                 type="button"
+                role="tab"
+                aria-selected={mode === t.id}
                 onClick={() => setMode(t.id)}
                 className={`py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
-                  mode === t.id ? 'bg-white text-sky-800 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  mode === t.id ? 'bg-white text-sky-800 shadow-xs' : 'text-slate-700 hover:text-slate-900'
                 }`}
               >
                 {t.icon}
@@ -423,7 +532,7 @@ export function SocraticTutorView({
           {mode === 'hint' && (
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-xs">
               <div className="flex items-center gap-2">
-                <span className="font-bold text-amber-900">Mức gợi ý:</span>
+                <span className="font-bold text-amber-950">Mức gợi ý:</span>
                 {[1, 2, 3].map((lvl) => (
                   <button
                     key={lvl}
@@ -433,7 +542,7 @@ export function SocraticTutorView({
                       sendTurn(`SOCO ơi, cho em xin gợi ý cấp độ ${lvl} cho bài này nhé!`, 'hint', lvl, false);
                     }}
                     className={`px-2.5 py-1 rounded-lg font-bold cursor-pointer ${
-                      hintLevel === lvl ? 'bg-amber-600 text-white' : 'bg-white text-amber-900 border border-amber-300'
+                      hintLevel === lvl ? 'bg-amber-700 text-white' : 'bg-white text-amber-950 border border-amber-300'
                     }`}
                   >
                     Cấp {lvl}
@@ -457,12 +566,23 @@ export function SocraticTutorView({
 
         {/* Messages Stream */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
+          {!isOnline && (
+            <div role="status" className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-950 flex items-center gap-2">
+              <WifiOff className="w-4 h-4 text-amber-700 shrink-0" aria-hidden="true" />
+              <span>Em đang ngoại tuyến. Hãy kết nối mạng để tiếp tục trò chuyện với Gia sư AI SOCO nhé!</span>
+            </div>
+          )}
+
           {messages.length === 0 ? (
             <div className="py-6 space-y-5">
               <SocoMascot
                 emotion="happy"
                 size="lg"
-                speech={`Chào ${user.display_name}! Em đang ở chế độ ${modeTabs.find((m) => m.id === mode)?.label} dành cho Lớp ${gradeLevel}. Hãy gửi bài tập, chụp ảnh hoặc hỏi bất kỳ điều gì em đang thắc mắc nhé!`}
+                speech={
+                  isGrade12Mode
+                    ? `Chào ${user.display_name}! Em hãy gửi câu hỏi hoặc chụp ảnh bài tập nhé!`
+                    : `Chào ${user.display_name}! Em đang ở chế độ ${modeTabs.find((m) => m.id === mode)?.label} dành cho Lớp ${gradeLevel}. Hãy gửi bài tập, chụp ảnh hoặc hỏi bất kỳ điều gì em đang thắc mắc nhé!`
+                }
               />
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 {[
@@ -475,7 +595,7 @@ export function SocraticTutorView({
                     key={sample}
                     type="button"
                     onClick={() => sendTurn(sample)}
-                    className="text-left p-3 rounded-2xl border border-slate-200 hover:border-sky-400 hover:bg-sky-50/50 text-xs font-medium text-slate-700 transition-colors cursor-pointer"
+                    className="text-left p-3 rounded-2xl border border-slate-200 hover:border-sky-400 hover:bg-sky-50/50 text-xs font-medium text-slate-800 transition-colors cursor-pointer"
                   >
                     {sample}
                   </button>
@@ -493,21 +613,23 @@ export function SocraticTutorView({
                   <div className="max-w-[90%] space-y-2">
                     <div className="bg-[#F7FBFF] border border-slate-200 rounded-2xl rounded-bl-sm px-4 py-3.5 text-sm md:text-[15px] leading-relaxed text-slate-800">
                       <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <span className="text-xs font-extrabold text-sky-700">SOCO Gia sư Socratic</span>
-                        <button
-                          type="button"
-                          onClick={() => speakText(m.content)}
-                          className="text-xs font-semibold text-slate-500 hover:text-sky-700 flex items-center gap-1 cursor-pointer"
-                          title="Đọc to câu này"
-                        >
-                          <Volume2 className="w-3.5 h-3.5" />
-                          <span>Nghe đọc</span>
-                        </button>
+                        <span className="text-xs font-extrabold text-sky-800">SOCO Gia sư Socratic</span>
+                        {speechSupported && (
+                          <button
+                            type="button"
+                            onClick={() => speakVietnamese(m.content)}
+                            className="text-xs font-semibold text-slate-600 hover:text-sky-800 flex items-center gap-1 cursor-pointer"
+                            aria-label="Nghe đọc to câu trả lời của SOCO"
+                          >
+                            <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                            <span>Nghe đọc</span>
+                          </button>
+                        )}
                       </div>
                       <p className="whitespace-pre-line">{m.content}</p>
                       {m.pedagogicalMeta?.isSolvedByStudent && (
                         <div className="mt-2.5 inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700">
-                          <CheckCircle className="w-4 h-4" />
+                          <CheckCircle className="w-4 h-4" aria-hidden="true" />
                           <span>Tuyệt vời! Em đã tự giải được bước này!</span>
                         </div>
                       )}
@@ -519,14 +641,16 @@ export function SocraticTutorView({
           )}
 
           {sending && (
-            <div className="flex items-center gap-3 p-3 rounded-2xl bg-violet-50 border border-violet-200 text-xs font-semibold text-violet-900">
-              <Sparkles className="w-4 h-4 text-violet-600" />
+            <div role="status" className="flex items-center gap-3 p-3 rounded-2xl bg-violet-50 border border-violet-200 text-xs font-semibold text-violet-900">
+              <Sparkles className="w-4 h-4 text-violet-600" aria-hidden="true" />
               <span>SOCO đang phân tích cách nghĩ của em để đặt câu hỏi gợi mở phù hợp...</span>
             </div>
           )}
 
           {error && (
-            <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-semibold text-red-700">{error}</div>
+            <div role="alert" className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-semibold text-red-700">
+              {error}
+            </div>
           )}
           <div ref={bottomRef} />
         </div>
@@ -537,23 +661,36 @@ export function SocraticTutorView({
             e.preventDefault();
             sendTurn();
           }}
-          className="p-4 border-t border-slate-200 bg-slate-50/70 rounded-b-3xl"
+          className="p-4 border-t border-slate-200 bg-slate-50/70 rounded-b-3xl space-y-2"
         >
+          {!voiceSupported && (
+            <p className="text-[11px] text-slate-600 font-medium">
+              Lưu ý: Trình duyệt này không hỗ trợ nhập giọng nói (SpeechRecognition). Em hãy gõ phím hoặc dùng nút Chụp ảnh đề bài nhé!
+            </p>
+          )}
           <div className="flex items-end gap-2">
             <button
               type="button"
               onClick={toggleVoiceInput}
-              className={`p-3 rounded-xl border transition-colors shrink-0 cursor-pointer ${
-                listening
-                  ? 'bg-red-50 border-red-400 text-red-700'
-                  : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
+              disabled={!voiceSupported}
+              aria-label={listening ? 'Dừng thu giọng nói' : 'Nhập câu hỏi bằng giọng nói'}
+              title={voiceSupported ? 'Nói bằng giọng nói' : 'Trình duyệt chưa hỗ trợ giọng nói'}
+              className={`p-3 rounded-xl border transition-colors shrink-0 ${
+                !voiceSupported
+                  ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
+                  : listening
+                  ? 'bg-red-50 border-red-400 text-red-700 cursor-pointer'
+                  : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100 cursor-pointer'
               }`}
-              title="Nói bằng giọng nói"
             >
               {listening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
             </button>
 
+            <label htmlFor="tutor-chat-input" className="sr-only">
+              Nội dung câu hỏi hoặc câu trả lời cho SOCO
+            </label>
             <textarea
+              id="tutor-chat-input"
               rows={2}
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
@@ -572,7 +709,7 @@ export function SocraticTutorView({
               disabled={sending || !inputText.trim()}
               className="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white font-bold text-sm flex items-center gap-1.5 shrink-0 cursor-pointer"
             >
-              <Send className="w-4 h-4" />
+              <Send className="w-4 h-4" aria-hidden="true" />
               <span>Gửi</span>
             </button>
           </div>
@@ -586,19 +723,21 @@ export function SocraticTutorView({
 
           <div className="pt-3 border-t border-slate-100 space-y-3">
             <div>
-              <div className="text-[11px] font-semibold text-slate-500">Chủ đề đang khám phá</div>
+              <div className="text-[11px] font-semibold text-slate-600">Chủ đề đang khám phá</div>
               <div className="text-sm font-bold text-slate-900 mt-0.5">{topic}</div>
             </div>
 
-            <div>
-              <div className="text-[11px] font-semibold text-slate-500">Mục tiêu học tập</div>
-              <p className="text-xs text-slate-700 mt-0.5 leading-relaxed">{latestObjective}</p>
-            </div>
+            {!isGrade12Mode && (
+              <div>
+                <div className="text-[11px] font-semibold text-slate-600">Mục tiêu học tập</div>
+                <p className="text-xs text-slate-700 mt-0.5 leading-relaxed">{latestObjective}</p>
+              </div>
+            )}
 
             <div>
-              <div className="flex justify-between text-[11px] font-semibold text-slate-500 mb-1">
+              <div className="flex justify-between text-[11px] font-semibold text-slate-600 mb-1">
                 <span>Mức độ nắm bắt</span>
-                <span className="tabular-nums font-bold text-sky-700">{understandingScore}/5</span>
+                <span className="tabular-nums font-bold text-sky-800">{understandingScore}/5</span>
               </div>
               <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
                 <div
@@ -610,7 +749,7 @@ export function SocraticTutorView({
 
             {latestPrereqs.length > 0 && (
               <div>
-                <div className="text-[11px] font-semibold text-slate-500 mb-1">Kiến thức nền liên quan</div>
+                <div className="text-[11px] font-semibold text-slate-600 mb-1">Kiến thức nền liên quan</div>
                 <ul className="space-y-1 text-xs text-slate-700 list-disc list-inside">
                   {latestPrereqs.map((p, idx) => (
                     <li key={idx}>{p}</li>
@@ -624,7 +763,7 @@ export function SocraticTutorView({
         {similarProblem && (
           <div className="bg-emerald-50 border border-emerald-200 rounded-3xl p-5 space-y-3">
             <div className="text-xs font-extrabold text-emerald-900 flex items-center gap-1.5">
-              <Zap className="w-4 h-4 text-emerald-600" />
+              <Zap className="w-4 h-4 text-emerald-600" aria-hidden="true" />
               <span>Bài tập tương tự rèn luyện</span>
             </div>
             <p className="text-xs text-emerald-950 leading-relaxed">{similarProblem}</p>

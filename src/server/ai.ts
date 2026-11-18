@@ -646,3 +646,110 @@ Hãy đề xuất ngắn gọn bằng Tiếng Việt:
     return JSON.parse((response.text ?? '{}').trim());
   });
 }
+
+export async function generateTeacherExerciseDraft(params: {
+  gradeLevel: number;
+  subjectName: string;
+  topic: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+  questionCount?: number;
+}): Promise<{
+  title: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  questions: Array<{
+    prompt: string;
+    options: string[];
+    correctAnswer: string;
+    explanation: string;
+  }>;
+}> {
+  const ai = getAiClient();
+  const count = Math.min(8, Math.max(2, Number(params.questionCount) || 4));
+  const diff = params.difficulty || 'medium';
+
+  const prompt = `Bạn là chuyên gia biên soạn học liệu tiểu học theo Chương trình Giáo dục Phổ thông 2018 (GDPT 2018) Việt Nam.
+Hãy tạo một bộ bài tập trắc nghiệm BẢN NHÁP (cần giáo viên kiểm duyệt trước khi dùng cho học sinh):
+- Lớp: Lớp ${params.gradeLevel}
+- Môn học: ${params.subjectName}
+- Chủ đề / Nội dung: ${params.topic}
+- Mức độ: ${diff === 'easy' ? 'Cơ bản (Nhận biết)' : diff === 'hard' ? 'Vận dụng nâng cao' : 'Thông hiểu'}
+- Số lượng câu hỏi: đúng ${count} câu.
+
+Yêu cầu nghiêm ngặt:
+1. Ngôn ngữ tiếng Việt trong sáng, chính xác kiến thức tiểu học GDPT 2018, phù hợp lứa tuổi lớp ${params.gradeLevel}.
+2. Mỗi câu hỏi có 4 phương án trả lời (options) rõ ràng, chỉ có 1 đáp án đúng (correctAnswer phải khớp chính xác 100% một phần tử trong options).
+3. Trường explanation giải thích ngắn gọn, dễ hiểu vì sao đáp án đó đúng để giúp học sinh tự suy nghĩ.
+4. Xuất JSON đúng theo schema.`;
+
+  return withRetry(async () => {
+    const response = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: prompt,
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            questions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  prompt: { type: Type.STRING },
+                  options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  correctAnswer: { type: Type.STRING },
+                  explanation: { type: Type.STRING },
+                },
+                required: ['prompt', 'options', 'correctAnswer', 'explanation'],
+              },
+            },
+          },
+          required: ['title', 'questions'],
+        },
+      },
+    });
+
+    const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+      title?: string;
+      questions?: Array<{
+        prompt?: string;
+        options?: string[];
+        correctAnswer?: string;
+        explanation?: string;
+      }>;
+    };
+
+    const sanitizedQuestions = (Array.isArray(parsed.questions) ? parsed.questions : [])
+      .slice(0, count)
+      .map((q) => {
+        const opts = Array.isArray(q.options) ? q.options.map((o) => String(o).trim()).filter(Boolean) : [];
+        let ans = String(q.correctAnswer || '').trim();
+        if (opts.length > 0 && !opts.includes(ans)) {
+          ans = opts[0];
+        }
+        return {
+          prompt: String(q.prompt || '').trim(),
+          options: opts.length >= 2 ? opts : [ans || 'Đáp án A', 'Đáp án B'],
+          correctAnswer: ans || opts[0] || 'Đáp án A',
+          explanation: String(q.explanation || 'Giáo viên duyệt nội dung giải thích.').trim(),
+        };
+      })
+      .filter((q) => q.prompt.length > 0);
+
+    if (sanitizedQuestions.length === 0) {
+      throw new AiServiceError(
+        'GEMINI_UPSTREAM_ERROR',
+        502,
+        'AI chưa tạo được câu hỏi hợp lệ. Thầy/cô vui lòng thử lại với chủ đề cụ thể hơn nhé.'
+      );
+    }
+
+    return {
+      title: String(parsed.title || `Bài tập AI (Nháp): ${params.topic}`).trim(),
+      difficulty: diff,
+      questions: sanitizedQuestions,
+    };
+  });
+}

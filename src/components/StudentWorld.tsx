@@ -17,8 +17,11 @@ import {
   Cpu,
   Clock,
   CheckCircle2,
+  Volume2,
 } from 'lucide-react';
 import { apiRequest, UserProfileData } from '../lib/api';
+import { heroLearningWorldImg } from '../lib/assets';
+import { useGradeMode } from '../lib/gradeMode';
 import { SocoMascot } from './SocoMascot';
 
 interface StudentWorldProps {
@@ -99,24 +102,23 @@ const SUBJECT_STYLES: Record<string, string> = {
 function renderSubjectIcon(name: string) {
   switch (name) {
     case 'Calculator':
-      return <Calculator className="w-5 h-5 text-sky-600" />;
+      return <Calculator className="w-5 h-5 text-sky-600" aria-hidden="true" />;
     case 'BookOpen':
-      return <BookOpen className="w-5 h-5 text-orange-600" />;
+      return <BookOpen className="w-5 h-5 text-orange-600" aria-hidden="true" />;
     case 'Leaf':
-      return <Leaf className="w-5 h-5 text-emerald-600" />;
+      return <Leaf className="w-5 h-5 text-emerald-600" aria-hidden="true" />;
     case 'Languages':
-      return <Languages className="w-5 h-5 text-violet-600" />;
+      return <Languages className="w-5 h-5 text-violet-600" aria-hidden="true" />;
     case 'HeartHandshake':
-      return <HeartHandshake className="w-5 h-5 text-amber-600" />;
+      return <HeartHandshake className="w-5 h-5 text-amber-600" aria-hidden="true" />;
     case 'Cpu':
-      return <Cpu className="w-5 h-5 text-violet-600" />;
+      return <Cpu className="w-5 h-5 text-violet-600" aria-hidden="true" />;
     default:
-      return <Compass className="w-5 h-5 text-sky-600" />;
+      return <Compass className="w-5 h-5 text-sky-600" aria-hidden="true" />;
   }
 }
 
 export function StudentWorld({
-  user,
   onUserUpdated,
   onOpenTutor,
   onOpenKnowledge,
@@ -128,6 +130,8 @@ export function StudentWorld({
   const [error, setError] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [joinMsg, setJoinMsg] = useState('');
+
+  const { isGrade12Mode, toggleGrade12Mode, speakVietnamese, speechSupported } = useGradeMode();
 
   async function loadDashboard() {
     setLoading(true);
@@ -213,21 +217,26 @@ export function StudentWorld({
   const earnedBadges = data.achievements.filter((a) => a.earned_at);
   const studyMinutes = Math.round((data.stats?.total_seconds || 0) / 60);
 
+  const greetingSpeech = isGrade12Mode
+    ? `Chào ${data.user.display_name}! Hôm nay mình cùng học vui nhé. Nhấn nút xanh để hỏi SOCO nào!`
+    : `Chào ${data.user.display_name}! Hôm nay là ngày thứ ${profile?.streak_days ?? 1} em kiên trì khám phá tri thức. Mình đang ở cấp độ ${level} — sẵn sàng chinh phục thử thách mới chưa?`;
+
   return (
     <div className="space-y-6">
       {/* Hero Greeting & Primary CTA */}
       <section className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
           <div className="lg:col-span-8 space-y-4">
-            <div className="flex flex-wrap items-center gap-3 text-xs font-semibold text-slate-500">
+            <div className="flex flex-wrap items-center gap-3 text-xs font-semibold text-slate-600">
               <span>{data.user.display_name}</span>
               <span aria-hidden="true">·</span>
-              <label className="inline-flex items-center gap-1.5 text-slate-700">
+              <label htmlFor="student-grade-select" className="inline-flex items-center gap-1.5 text-slate-700">
                 <span>Đang học:</span>
                 <select
+                  id="student-grade-select"
                   value={gradeLevel}
                   onChange={(e) => handleChangeGrade(Number(e.target.value))}
-                  className="bg-sky-50 border border-sky-200 rounded-lg px-2 py-0.5 text-xs font-bold text-sky-900 cursor-pointer"
+                  className="bg-sky-50 border border-sky-200 rounded-lg px-2 py-1 text-xs font-bold text-sky-900 cursor-pointer"
                 >
                   {[1, 2, 3, 4, 5].map((g) => (
                     <option key={g} value={g}>
@@ -236,6 +245,20 @@ export function StudentWorld({
                   ))}
                 </select>
               </label>
+
+              <button
+                type="button"
+                aria-pressed={isGrade12Mode}
+                onClick={toggleGrade12Mode}
+                className={`px-3 py-1 rounded-lg border text-xs font-bold cursor-pointer transition-colors ${
+                  isGrade12Mode
+                    ? 'bg-emerald-50 border-emerald-400 text-emerald-900'
+                    : 'bg-slate-50 border-slate-300 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                Chế độ Lớp 1–2: {isGrade12Mode ? 'Đang bật (Chữ lớn)' : 'Tắt'}
+              </button>
+
               {profile?.link_code && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -246,11 +269,19 @@ export function StudentWorld({
               )}
             </div>
 
-            <SocoMascot
-              emotion="happy"
-              size="lg"
-              speech={`Chào ${data.user.display_name}! Hôm nay là ngày thứ ${profile?.streak_days ?? 1} em kiên trì khám phá tri thức. Mình đang ở cấp độ ${level} — sẵn sàng chinh phục thử thách mới chưa?`}
-            />
+            <div className="space-y-2">
+              <SocoMascot emotion="happy" size="lg" speech={greetingSpeech} />
+              {speechSupported && (
+                <button
+                  type="button"
+                  onClick={() => speakVietnamese(greetingSpeech)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-700 hover:text-sky-900 cursor-pointer"
+                >
+                  <Volume2 className="w-4 h-4" aria-hidden="true" />
+                  <span>Nghe SOCO chào hỏi</span>
+                </button>
+              )}
+            </div>
 
             <div className="flex flex-wrap items-center gap-3 pt-2">
               <button
@@ -258,26 +289,26 @@ export function StudentWorld({
                 onClick={() => onOpenTutor()}
                 className="px-6 py-3.5 rounded-2xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-base flex items-center gap-2.5 shadow-xs transition-colors cursor-pointer"
               >
-                <MessageSquare className="w-5 h-5" />
-                <span>Bắt đầu học cùng SOCO</span>
+                <MessageSquare className="w-5 h-5" aria-hidden="true" />
+                <span>{isGrade12Mode ? 'Hỏi SOCO ngay' : 'Bắt đầu học cùng SOCO'}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => onOpenTutor({ openScanner: true })}
-                className="px-5 py-3.5 rounded-2xl bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-900 font-bold text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                className="px-5 py-3.5 rounded-2xl bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-950 font-bold text-sm flex items-center gap-2 transition-colors cursor-pointer"
               >
-                <ScanSearch className="w-4 h-4 text-orange-600" />
+                <ScanSearch className="w-4 h-4 text-orange-600" aria-hidden="true" />
                 <span>Chụp ảnh bài tập</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => onOpenGames()}
-                className="px-5 py-3.5 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-900 font-bold text-sm flex items-center gap-2 transition-colors cursor-pointer"
+                className="px-5 py-3.5 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-950 font-bold text-sm flex items-center gap-2 transition-colors cursor-pointer"
               >
-                <Gamepad2 className="w-4 h-4 text-emerald-600" />
-                <span>Chơi & Học</span>
+                <Gamepad2 className="w-4 h-4 text-emerald-600" aria-hidden="true" />
+                <span>Chơi &amp; Học</span>
               </button>
             </div>
           </div>
@@ -286,13 +317,13 @@ export function StudentWorld({
           <div className="lg:col-span-4 bg-[#F7FBFF] border border-slate-200 rounded-2xl p-5 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-xs font-semibold text-slate-500">Cấp độ Khám phá</div>
+                <div className="text-xs font-semibold text-slate-600">Cấp độ Khám phá</div>
                 <div className="font-display text-2xl font-extrabold text-slate-900 tabular-nums">
                   Level {level} · {xp} XP
                 </div>
               </div>
               <div className="w-11 h-11 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center">
-                <Trophy className="w-6 h-6" />
+                <Trophy className="w-6 h-6" aria-hidden="true" />
               </div>
             </div>
 
@@ -309,24 +340,24 @@ export function StudentWorld({
             <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-200 text-center">
               <div>
                 <div className="inline-flex items-center gap-1 text-base font-extrabold text-orange-600 tabular-nums">
-                  <Flame className="w-4 h-4" />
+                  <Flame className="w-4 h-4" aria-hidden="true" />
                   <span>{profile?.streak_days ?? 1}</span>
                 </div>
-                <div className="text-[11px] text-slate-500">Ngày liên tiếp</div>
+                <div className="text-[11px] text-slate-600">Ngày liên tiếp</div>
               </div>
               <div>
                 <div className="inline-flex items-center gap-1 text-base font-extrabold text-sky-700 tabular-nums">
-                  <Clock className="w-4 h-4" />
+                  <Clock className="w-4 h-4" aria-hidden="true" />
                   <span>{studyMinutes}p</span>
                 </div>
-                <div className="text-[11px] text-slate-500">Thời gian học</div>
+                <div className="text-[11px] text-slate-600">Thời gian học</div>
               </div>
               <div>
                 <div className="inline-flex items-center gap-1 text-base font-extrabold text-emerald-700 tabular-nums">
-                  <Award className="w-4 h-4" />
+                  <Award className="w-4 h-4" aria-hidden="true" />
                   <span>{earnedBadges.length}</span>
                 </div>
-                <div className="text-[11px] text-slate-500">Huy hiệu</div>
+                <div className="text-[11px] text-slate-600">Huy hiệu</div>
               </div>
             </div>
           </div>
@@ -337,10 +368,12 @@ export function StudentWorld({
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
         <div className="lg:col-span-8 bg-white border border-slate-200 rounded-3xl p-6 flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between gap-4 mb-4">
+            <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
               <div>
                 <h2 className="font-display text-xl font-extrabold text-slate-900">Bản đồ Thế giới Học tập Lớp {gradeLevel}</h2>
-                <p className="text-xs text-slate-500 mt-0.5">Chọn một khu vực môn học để mở bài giảng hoặc hỏi SOCO</p>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  {isGrade12Mode ? 'Chọn môn em thích để học hoặc hỏi SOCO' : 'Chọn một khu vực môn học để mở bài giảng hoặc hỏi SOCO'}
+                </p>
               </div>
               <button
                 type="button"
@@ -353,9 +386,10 @@ export function StudentWorld({
 
             <div className="rounded-2xl overflow-hidden border border-slate-200 aspect-16/9 mb-5 bg-sky-50">
               <img
-                src="/src/assets/images/hero_learning_world_1794794874331.jpg"
-                alt="Bản đồ các đảo môn học tiểu học"
-                referrerPolicy="no-referrer"
+                src={heroLearningWorldImg}
+                alt={`Bản đồ các đảo môn học tiểu học Lớp ${gradeLevel}`}
+                loading="lazy"
+                decoding="async"
                 className="w-full h-full object-cover"
               />
             </div>
@@ -371,19 +405,19 @@ export function StudentWorld({
                         <span>{sub.name}</span>
                       </div>
                     </div>
-                    <p className="mt-1.5 text-xs opacity-80 line-clamp-2">{sub.description}</p>
+                    {!isGrade12Mode && <p className="mt-1.5 text-xs opacity-80 line-clamp-2">{sub.description}</p>}
                     <div className="mt-3 flex items-center gap-2">
                       <button
                         type="button"
                         onClick={() => onOpenKnowledge(sub.id)}
-                        className="px-2.5 py-1.5 rounded-lg bg-white/90 hover:bg-white text-slate-900 text-xs font-bold border border-slate-200 cursor-pointer"
+                        className="px-3 py-1.5 rounded-lg bg-white/95 hover:bg-white text-slate-900 text-xs font-bold border border-slate-200 cursor-pointer"
                       >
                         Học bài
                       </button>
                       <button
                         type="button"
                         onClick={() => onOpenTutor({ subjectId: sub.id })}
-                        className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold cursor-pointer"
+                        className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold cursor-pointer"
                       >
                         Hỏi SOCO
                       </button>
@@ -397,7 +431,6 @@ export function StudentWorld({
 
         {/* Right Column: Today's Missions + Teacher Assignments + Classes */}
         <div className="lg:col-span-4 space-y-6">
-          {/* Today's Missions */}
           <div className="bg-white border border-slate-200 rounded-3xl p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="font-display text-lg font-extrabold text-slate-900">Nhiệm vụ hôm nay</h2>
@@ -416,13 +449,13 @@ export function StudentWorld({
                   <div className="flex items-start justify-between gap-2">
                     <div className="text-sm font-bold text-slate-900">{m.title}</div>
                     {m.completed ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" aria-label="Đã hoàn thành" />
                     ) : (
-                      <span className="text-xs font-bold text-amber-700 tabular-nums shrink-0">+{m.xp_reward} XP</span>
+                      <span className="text-xs font-bold text-amber-800 tabular-nums shrink-0">+{m.xp_reward} XP</span>
                     )}
                   </div>
-                  <p className="text-xs text-slate-600 mt-1">{m.description}</p>
-                  <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-500 tabular-nums">
+                  {!isGrade12Mode && <p className="text-xs text-slate-600 mt-1">{m.description}</p>}
+                  <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-slate-600 tabular-nums">
                     <span>{m.mission_type === 'daily' ? 'Hằng ngày' : 'Hằng tuần'}</span>
                     <span>
                       {Math.min(m.current_count, m.target_count)}/{m.target_count}
@@ -433,12 +466,13 @@ export function StudentWorld({
             </div>
           </div>
 
-          {/* Assignments & Join Class */}
           <div className="bg-white border border-slate-200 rounded-3xl p-6">
             <h2 className="font-display text-lg font-extrabold text-slate-900 mb-3">Bài tập từ Thầy Cô</h2>
 
             {data.assignments.length === 0 ? (
-              <p className="text-xs text-slate-500">Chưa có bài tập nào được giao. Em có thể nhập mã lớp bên dưới để tham gia lớp học.</p>
+              <p className="text-xs text-slate-600">
+                Chưa có bài tập nào được giao. Em có thể nhập mã lớp bên dưới để tham gia lớp học.
+              </p>
             ) : (
               <div className="space-y-2.5 mb-4">
                 {data.assignments.map((a) => (
@@ -448,7 +482,7 @@ export function StudentWorld({
                       {a.class_name} · Hạn: {a.due_date}
                     </div>
                     <div className="mt-2 flex items-center justify-between">
-                      <span className="text-xs font-semibold text-sky-800">
+                      <span className="text-xs font-semibold text-sky-900">
                         {a.submission_status === 'assigned'
                           ? 'Chưa làm'
                           : a.submission_status === 'submitted'
@@ -469,26 +503,29 @@ export function StudentWorld({
             )}
 
             <form onSubmit={handleJoinClass} className="pt-3 border-t border-slate-100">
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5">Tham gia lớp học bằng mã lớp</label>
+              <label htmlFor="join-class-code" className="block text-xs font-semibold text-slate-700 mb-1.5">
+                Tham gia lớp học bằng mã lớp
+              </label>
               <div className="flex gap-2">
                 <input
+                  id="join-class-code"
                   type="text"
                   value={joinCode}
                   onChange={(e) => setJoinCode(e.target.value)}
                   placeholder="Ví dụ: SOCO4A"
-                  className="flex-1 px-3 py-2 rounded-xl border border-slate-300 text-xs uppercase font-mono-nums"
+                  className="flex-1 min-w-0 px-3 py-2 rounded-xl border border-slate-300 text-xs uppercase font-mono-nums"
                 />
                 <button
                   type="submit"
-                  className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                  className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1 shrink-0 cursor-pointer"
                 >
-                  <PlusCircle className="w-3.5 h-3.5" />
+                  <PlusCircle className="w-3.5 h-3.5" aria-hidden="true" />
                   <span>Vào lớp</span>
                 </button>
               </div>
-              {joinMsg && <p className="mt-1.5 text-xs text-sky-700 font-medium">{joinMsg}</p>}
+              {joinMsg && <p className="mt-1.5 text-xs text-sky-800 font-medium">{joinMsg}</p>}
               {data.classes.length > 0 && (
-                <div className="mt-2 text-xs text-slate-500">
+                <div className="mt-2 text-xs text-slate-600">
                   Lớp đang học: {data.classes.map((c) => `${c.name} (${c.teacher_name})`).join(', ')}
                 </div>
               )}
@@ -511,7 +548,7 @@ export function StudentWorld({
             </button>
           </div>
           {data.sessions.length === 0 ? (
-            <p className="text-sm text-slate-500">Em chưa có buổi học nào với SOCO. Hãy bắt đầu câu hỏi đầu tiên nhé!</p>
+            <p className="text-sm text-slate-600">Em chưa có buổi học nào với SOCO. Hãy bắt đầu câu hỏi đầu tiên nhé!</p>
           ) : (
             <div className="space-y-2.5">
               {data.sessions.map((s) => (
@@ -523,7 +560,7 @@ export function StudentWorld({
                 >
                   <div className="min-w-0">
                     <div className="font-bold text-sm text-slate-900 truncate">{s.topic}</div>
-                    <div className="text-xs text-slate-500 mt-0.5">
+                    <div className="text-xs text-slate-600 mt-0.5">
                       {s.subject_name} · Lớp {s.grade_level} · Chế độ {s.mode}
                     </div>
                   </div>
@@ -550,11 +587,11 @@ export function StudentWorld({
               <div
                 key={a.id}
                 className={`p-3.5 rounded-2xl border ${
-                  a.earned_at ? 'bg-amber-50/70 border-amber-200' : 'bg-slate-50 border-slate-200 opacity-65'
+                  a.earned_at ? 'bg-amber-50/70 border-amber-200' : 'bg-slate-50 border-slate-200 opacity-75'
                 }`}
               >
                 <div className="flex items-center gap-2 font-bold text-sm text-slate-900">
-                  <Sparkles className={`w-4 h-4 ${a.earned_at ? 'text-amber-600' : 'text-slate-400'}`} />
+                  <Sparkles className={`w-4 h-4 ${a.earned_at ? 'text-amber-600' : 'text-slate-400'}`} aria-hidden="true" />
                   <span>{a.title}</span>
                 </div>
                 <p className="text-xs text-slate-600 mt-1">{a.description}</p>

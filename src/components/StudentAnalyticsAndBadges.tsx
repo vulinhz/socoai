@@ -144,8 +144,13 @@ export function StudentAnalyticsAndBadges({ user }: { user: UserProfileData }) {
                 Đánh giá kết hợp độ chính xác, số lần luyện tập và mức độ cần trợ giúp từ AI
               </p>
             </div>
-            <button type="button" onClick={loadAll} className="p-2 rounded-xl hover:bg-slate-100 text-slate-600 cursor-pointer">
-              <RefreshCw className="w-4 h-4" />
+            <button
+              type="button"
+              onClick={loadAll}
+              aria-label="Tải lại thống kê năng lực"
+              className="p-2 rounded-xl hover:bg-slate-100 text-slate-700 cursor-pointer"
+            >
+              <RefreshCw className="w-4 h-4" aria-hidden="true" />
             </button>
           </div>
 

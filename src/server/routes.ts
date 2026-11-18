@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
-import { db } from './db.ts';
+import { cleanupExpiredConversations, db } from './db.ts';
 import {
   authenticate,
   AuthRequest,
@@ -21,6 +21,7 @@ import {
   generateParentCompanionAdvice,
   generateSocraticTurn,
   generateTeacherClassInsights,
+  generateTeacherExerciseDraft,
   scanProblemImage,
 } from './ai.ts';
 
@@ -67,7 +68,14 @@ function getFullUserPayload(userId: number) {
 
 apiRouter.post('/auth/register', (req, res) => {
   try {
-    const { username, password, displayName, role, gradeLevel, email, schoolName, relationshipLabel } = req.body || {};
+    const { username, password, displayName, role, gradeLevel, email, schoolName, relationshipLabel, acceptedTerms } = req.body || {};
+
+    if (acceptedTerms !== true) {
+      return res.status(400).json({
+        error: 'Vui lòng đọc và đánh dấu đồng ý với Chính sách bảo mật, Điều khoản sử dụng và Chính sách dữ liệu trẻ em trước khi đăng ký.',
+        code: 'TERMS_NOT_ACCEPTED',
+      });
+    }
 
     if (!displayName || typeof displayName !== 'string' || displayName.trim().length < 2) {
       return res.status(400).json({ error: 'Vui lòng nhập tên hiển thị (ít nhất 2 ký tự).', code: 'INVALID_DISPLAY_NAME' });
@@ -128,8 +136,8 @@ apiRouter.post('/auth/register', (req, res) => {
     const createAccountTx = db.transaction(() => {
       const newUserId = db
         .prepare(
-          `INSERT INTO users (username, email, password_hash, display_name, role, is_verified, verification_code, parental_consent_status, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+          `INSERT INTO users (username, email, password_hash, display_name, role, is_verified, verification_code, parental_consent_status, status, accepted_terms_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
         )
         .run(
           cleanUsername,
@@ -184,7 +192,6 @@ apiRouter.post('/auth/register', (req, res) => {
       token,
       refreshToken,
       user,
-      verificationHint: targetRole !== 'student' ? verificationCode : undefined,
     });
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -334,8 +341,7 @@ apiRouter.post('/auth/forgot-password', (req, res) => {
       row.id
     );
     res.json({
-      message: 'Mã khôi phục mật khẩu đã được tạo (hiệu lực 30 phút).',
-      resetTokenPreview: resetToken,
+      message: 'Nếu tài khoản tồn tại, yêu cầu khôi phục mật khẩu đã được ghi nhận (hiệu lực 30 phút).',
     });
   } catch (err: unknown) {
     console.error('Forgot password error:', err instanceof Error ? err.message : String(err));
@@ -424,6 +430,9 @@ apiRouter.get('/curriculum/lessons', authenticate, (req: AuthRequest, res: Respo
   const semester = req.query.semester ? Number(req.query.semester) : null;
   const search = req.query.search ? String(req.query.search).trim().toLowerCase() : '';
 
+  const reviewStatus = req.query.reviewStatus ? String(req.query.reviewStatus) : null;
+  const isStaff = req.user!.role === 'teacher' || req.user!.role === 'admin';
+
   let sql = `
     SELECT l.*, cu.title as unit_title, cu.semester, cu.grade_id, cu.subject_id,
            g.level as grade_level, g.name as grade_name,
@@ -432,9 +441,17 @@ apiRouter.get('/curriculum/lessons', authenticate, (req: AuthRequest, res: Respo
     JOIN curriculum_units cu ON l.unit_id = cu.id
     JOIN grades g ON cu.grade_id = g.id
     JOIN subjects s ON cu.subject_id = s.id
-    WHERE (l.status = 'published' OR l.created_by = ?)
+    WHERE 1=1
   `;
-  const params: unknown[] = [req.user!.id];
+  const params: unknown[] = [];
+
+  if (!isStaff) {
+    // Students strictly see only approved & published content (AI-generated content never auto-shows)
+    sql += ` AND l.review_status = 'published' AND l.status = 'published'`;
+  } else if (reviewStatus) {
+    sql += ' AND l.review_status = ?';
+    params.push(reviewStatus);
+  }
 
   if (gradeLevel) {
     sql += ' AND g.level = ?';
@@ -980,6 +997,8 @@ apiRouter.get('/games', authenticate, (req: AuthRequest, res: Response) => {
   const gradeLevel = req.query.gradeLevel ? Number(req.query.gradeLevel) : null;
   const subjectId = req.query.subjectId ? Number(req.query.subjectId) : null;
   const gameType = req.query.gameType ? String(req.query.gameType) : null;
+  const reviewStatus = req.query.reviewStatus ? String(req.query.reviewStatus) : null;
+  const isStaff = req.user!.role === 'teacher' || req.user!.role === 'admin';
 
   let sql = `
     SELECT e.*, g.level as grade_level, g.name as grade_name, s.name as subject_name, s.color_token
@@ -989,6 +1008,12 @@ apiRouter.get('/games', authenticate, (req: AuthRequest, res: Response) => {
     WHERE 1=1
   `;
   const params: unknown[] = [];
+  if (!isStaff) {
+    sql += ` AND e.review_status = 'published'`;
+  } else if (reviewStatus) {
+    sql += ' AND e.review_status = ?';
+    params.push(reviewStatus);
+  }
   if (gradeLevel) {
     sql += ' AND g.level = ?';
     params.push(gradeLevel);
@@ -1122,7 +1147,9 @@ apiRouter.get('/teacher/overview', authenticate, requireRole('teacher', 'admin')
         `SELECT u.id, u.username, u.display_name, cm.class_id, c.name as class_name,
                 sp.xp, sp.level, sp.streak_days, g.level as grade_level,
                 COALESCE((SELECT ROUND(AVG(mastery_score)) FROM skill_mastery sm WHERE sm.student_id = u.id), 0) as avg_mastery,
-                COALESCE((SELECT COUNT(*) FROM learning_progress lp WHERE lp.student_id = u.id AND lp.status = 'completed'), 0) as completed_items
+                COALESCE((SELECT COUNT(*) FROM learning_progress lp WHERE lp.student_id = u.id AND lp.status = 'completed'), 0) as completed_items,
+                COALESCE((SELECT ROUND(SUM(lp.time_spent_seconds) / 60.0) FROM learning_progress lp WHERE lp.student_id = u.id AND datetime(lp.last_accessed_at) >= datetime('now', '-7 days')), 0) as weekly_minutes,
+                COALESCE((SELECT COUNT(*) FROM tutoring_sessions ts WHERE ts.student_id = u.id AND datetime(ts.updated_at) >= datetime('now', '-7 days')), 0) as weekly_ai_sessions
          FROM class_members cm
          JOIN users u ON cm.student_id = u.id
          JOIN classes c ON cm.class_id = c.id
@@ -1171,14 +1198,38 @@ apiRouter.get('/teacher/overview', authenticate, requireRole('teacher', 'admin')
 
   const lessons = db
     .prepare(
-      `SELECT l.id, l.title, l.status, cu.title as unit_title, g.level as grade_level, s.name as subject_name
+      `SELECT l.id, l.title, l.status, l.review_status, l.is_ai_generated, l.created_at,
+              cu.title as unit_title, g.level as grade_level, s.name as subject_name
        FROM lessons l
        JOIN curriculum_units cu ON l.unit_id = cu.id
        JOIN grades g ON cu.grade_id = g.id
        JOIN subjects s ON cu.subject_id = s.id
-       ORDER BY l.id DESC`
+       ORDER BY CASE l.review_status WHEN 'draft' THEN 0 WHEN 'approved' THEN 1 WHEN 'published' THEN 2 ELSE 3 END, l.id DESC`
     )
     .all();
+
+  const exercisesRaw = db
+    .prepare(
+      `SELECT e.id, e.title, e.game_type, e.difficulty, e.xp_reward, e.review_status, e.is_ai_generated, e.created_at,
+              g.level as grade_level, s.name as subject_name,
+              (SELECT COUNT(*) FROM exercise_questions eq WHERE eq.exercise_id = e.id) as question_count
+       FROM exercises e
+       JOIN grades g ON e.grade_id = g.id
+       JOIN subjects s ON e.subject_id = s.id
+       ORDER BY CASE e.review_status WHEN 'draft' THEN 0 WHEN 'approved' THEN 1 WHEN 'published' THEN 2 ELSE 3 END, e.id DESC`
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const exQuestions = db
+    .prepare('SELECT id, exercise_id, prompt, options_json, correct_answer, explanation, order_index FROM exercise_questions ORDER BY order_index ASC')
+    .all() as Array<Record<string, unknown>>;
+
+  const exercises = exercisesRaw.map((ex) => ({
+    ...ex,
+    questions: exQuestions
+      .filter((q) => q.exercise_id === ex.id)
+      .map((q) => ({ ...q, options: JSON.parse(String(q.options_json || '[]')) })),
+  }));
 
   const materials = db
     .prepare(
@@ -1200,7 +1251,7 @@ apiRouter.get('/teacher/overview', authenticate, requireRole('teacher', 'admin')
     )
     .all();
 
-  res.json({ classes, students, assignments, submissions, commonMistakes, lessons, materials, units });
+  res.json({ classes, students, assignments, submissions, commonMistakes, lessons, exercises, materials, units });
 });
 
 apiRouter.post('/teacher/classes', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
@@ -1223,6 +1274,21 @@ apiRouter.post('/teacher/assignments', authenticate, requireRole('teacher', 'adm
   if (!classId || !title || !dueDate) {
     return res.status(400).json({ error: 'Vui lòng chọn lớp, nhập tiêu đề và hạn nộp.' });
   }
+
+  if (exerciseId) {
+    const ex = db.prepare('SELECT id, review_status FROM exercises WHERE id = ?').get(Number(exerciseId)) as
+      | { id: number; review_status: string }
+      | undefined;
+    if (!ex) {
+      return res.status(404).json({ error: 'Không tìm thấy bài tập được chọn.' });
+    }
+    if (ex.review_status !== 'approved' && ex.review_status !== 'published') {
+      return res.status(400).json({
+        error: 'Bài tập này đang ở trạng thái Nháp / chờ giáo viên duyệt. Vui lòng duyệt và xuất bản trước khi giao cho học sinh.',
+      });
+    }
+  }
+
   const assignId = db
     .prepare(
       `INSERT INTO teacher_assignments (class_id, teacher_id, subject_id, title, instructions, due_date, exercise_id)
@@ -1254,14 +1320,15 @@ apiRouter.post('/teacher/submissions/:id/grade', authenticate, requireRole('teac
 });
 
 apiRouter.post('/teacher/lessons', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
-  const { unitId, title, objectives, coreKnowledge, reviewNotes, status = 'published' } = req.body || {};
+  const { unitId, title, objectives, coreKnowledge, reviewNotes, status = 'draft' } = req.body || {};
   if (!unitId || !title || !coreKnowledge) {
     return res.status(400).json({ error: 'Vui lòng chọn chủ đề, nhập tên bài và kiến thức trọng tâm.' });
   }
+  const safeStatus = status === 'published' ? 'published' : 'draft';
   const id = db
     .prepare(
-      `INSERT INTO lessons (unit_id, title, objectives, core_knowledge, illustration_url, review_notes, status, created_by)
-       VALUES (?, ?, ?, ?, '/src/assets/images/hero_learning_world_1794794874331.jpg', ?, ?, ?)`
+      `INSERT INTO lessons (unit_id, title, objectives, core_knowledge, illustration_url, review_notes, status, review_status, is_ai_generated, created_by)
+       VALUES (?, ?, ?, ?, '/src/assets/images/hero_learning_world.webp', ?, ?, ?, 0, ?)`
     )
     .run(
       Number(unitId),
@@ -1269,10 +1336,14 @@ apiRouter.post('/teacher/lessons', authenticate, requireRole('teacher', 'admin')
       String(objectives || 'Hiểu và vận dụng kiến thức bài học').trim(),
       String(coreKnowledge).trim(),
       String(reviewNotes || 'Ôn lại ví dụ và tự đặt 1 câu hỏi cho SOCO.').trim(),
-      status === 'draft' ? 'draft' : 'published',
+      safeStatus,
+      safeStatus,
       req.user!.id
     ).lastInsertRowid;
-  res.status(201).json({ id, message: 'Đã thêm bài học mới vào Kho Tri thức.' });
+  res.status(201).json({
+    id,
+    message: safeStatus === 'published' ? 'Đã xuất bản bài học mới vào Kho Tri thức.' : 'Đã lưu bài học mới ở trạng thái Nháp.',
+  });
 });
 
 apiRouter.post('/teacher/materials', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
@@ -1290,16 +1361,17 @@ apiRouter.post('/teacher/materials', authenticate, requireRole('teacher', 'admin
 });
 
 apiRouter.post('/teacher/exercises', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
-  const { gradeId, subjectId, title, prompt, options, correctAnswer, explanation } = req.body || {};
+  const { gradeId, subjectId, title, prompt, options, correctAnswer, explanation, reviewStatus = 'draft' } = req.body || {};
   if (!title || !prompt || !correctAnswer) {
     return res.status(400).json({ error: 'Vui lòng nhập tiêu đề, câu hỏi và đáp án đúng.' });
   }
+  const safeReview = ['draft', 'approved', 'published'].includes(reviewStatus) ? reviewStatus : 'draft';
   const exId = db
     .prepare(
-      `INSERT INTO exercises (grade_id, subject_id, title, game_type, difficulty, xp_reward, created_by)
-       VALUES (?, ?, ?, 'quiz', 'medium', 35, ?)`
+      `INSERT INTO exercises (grade_id, subject_id, title, game_type, difficulty, xp_reward, review_status, is_ai_generated, created_by)
+       VALUES (?, ?, ?, 'quiz', 'medium', 35, ?, 0, ?)`
     )
-    .run(Number(gradeId) || 4, Number(subjectId) || 1, String(title).trim(), req.user!.id).lastInsertRowid as number;
+    .run(Number(gradeId) || 4, Number(subjectId) || 1, String(title).trim(), safeReview, req.user!.id).lastInsertRowid as number;
 
   db.prepare(
     `INSERT INTO exercise_questions (exercise_id, question_type, prompt, options_json, correct_answer, explanation, order_index)
@@ -1313,6 +1385,345 @@ apiRouter.post('/teacher/exercises', authenticate, requireRole('teacher', 'admin
   );
 
   res.status(201).json({ id: exId, message: 'Đã tạo bài tập mới thành công!' });
+});
+
+// ==================== AI EXERCISE DRAFT GENERATOR (ALWAYS DRAFT UNTIL APPROVED) ====================
+
+apiRouter.post('/teacher/ai-generate-exercise', authenticate, requireRole('teacher', 'admin'), async (req: AuthRequest, res: Response) => {
+  const start = Date.now();
+  try {
+    const { gradeLevel = 4, subjectId = 1, topic, difficulty = 'medium', questionCount = 4 } = req.body || {};
+    if (!topic || String(topic).trim().length < 3) {
+      return res.status(400).json({ error: 'Vui lòng nhập chủ đề hoặc nội dung bài tập muốn AI soạn thảo.' });
+    }
+
+    const lvl = Math.min(5, Math.max(1, Number(gradeLevel) || 4));
+    const gradeRow = db.prepare('SELECT id FROM grades WHERE level = ?').get(lvl) as { id: number };
+    const subjectRow = db.prepare('SELECT id, name FROM subjects WHERE id = ?').get(Number(subjectId) || 1) as
+      | { id: number; name: string }
+      | undefined;
+
+    const draft = await generateTeacherExerciseDraft({
+      gradeLevel: lvl,
+      subjectName: subjectRow?.name || 'Toán học',
+      topic: String(topic).trim(),
+      difficulty: (['easy', 'medium', 'hard'].includes(difficulty) ? difficulty : 'medium') as 'easy' | 'medium' | 'hard',
+      questionCount: Number(questionCount) || 4,
+    });
+
+    const saveDraftTx = db.transaction(() => {
+      const exId = Number(
+        db
+          .prepare(
+            `INSERT INTO exercises (grade_id, subject_id, title, game_type, difficulty, xp_reward, review_status, is_ai_generated, created_by)
+             VALUES (?, ?, ?, 'quiz', ?, ?, 'draft', 1, ?)`
+          )
+          .run(
+            gradeRow.id,
+            subjectRow?.id || 1,
+            draft.title,
+            draft.difficulty,
+            draft.difficulty === 'hard' ? 45 : draft.difficulty === 'easy' ? 30 : 35,
+            req.user!.id
+          ).lastInsertRowid
+      );
+
+      const insQ = db.prepare(
+        `INSERT INTO exercise_questions (exercise_id, question_type, prompt, options_json, correct_answer, explanation, order_index)
+         VALUES (?, 'quiz', ?, ?, ?, ?, ?)`
+      );
+      draft.questions.forEach((q, idx) => {
+        insQ.run(exId, q.prompt, JSON.stringify(q.options), q.correctAnswer, q.explanation, idx + 1);
+      });
+      return exId;
+    });
+
+    const exerciseId = saveDraftTx();
+
+    db.prepare(
+      `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, mode, status, safety_flagged, latency_ms)
+       VALUES (?, '/api/teacher/ai-generate-exercise', 'gemini-4-hydrogen', ?, 'teacher_draft', 'success', 0, ?)`
+    ).run(req.user!.id, lvl, Date.now() - start);
+
+    res.status(201).json({
+      exerciseId,
+      reviewStatus: 'draft',
+      isAiGenerated: true,
+      draft,
+      message: 'Đã tạo bản nháp bài tập bằng AI (Cần giáo viên duyệt). Học sinh chưa thể thấy bài này cho tới khi được duyệt và xuất bản.',
+    });
+  } catch (err: unknown) {
+    const aiErr = classifyGeminiError(err);
+    console.error('AI exercise draft error:', aiErr.message);
+    res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
+  }
+});
+
+// ==================== BULK IMPORT & CONTENT APPROVAL WORKFLOW ====================
+
+apiRouter.post('/content/bulk-import', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
+  try {
+    const { kind, items } = req.body || {};
+    if (!['lessons', 'exercises', 'questions'].includes(kind)) {
+      return res.status(400).json({ error: 'Loại dữ liệu import không hợp lệ (lessons, exercises hoặc questions).' });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Không có dòng dữ liệu hợp lệ để import.' });
+    }
+    if (items.length > 200) {
+      return res.status(400).json({ error: 'Mỗi lần import tối đa 200 dòng để đảm bảo an toàn.' });
+    }
+
+    const grades = db.prepare('SELECT id, level FROM grades').all() as Array<{ id: number; level: number }>;
+    const gradeMap = new Map(grades.map((g) => [g.level, g.id]));
+    const subjects = db.prepare('SELECT id, code, name FROM subjects').all() as Array<{ id: number; code: string; name: string }>;
+
+    const resolveSubjectId = (val: unknown): number | null => {
+      if (typeof val === 'number' && subjects.some((s) => s.id === val)) return val;
+      const raw = String(val || '').trim().toLowerCase();
+      if (!raw) return null;
+      const byCode = subjects.find((s) => s.code.toLowerCase() === raw);
+      if (byCode) return byCode.id;
+      const byName = subjects.find((s) => s.name.toLowerCase() === raw || s.name.toLowerCase().includes(raw));
+      return byName ? byName.id : null;
+    };
+
+    const rowErrors: Array<{ row: number; message: string }> = [];
+    const validRows: Array<Record<string, unknown>> = [];
+
+    items.forEach((rawItem: Record<string, unknown>, idx: number) => {
+      const rowNum = idx + 1;
+      const gradeLevel = Number(rawItem.gradeLevel ?? rawItem.grade ?? rawItem.lop);
+      const subjectId = resolveSubjectId(rawItem.subjectCode ?? rawItem.subject ?? rawItem.monHoc ?? rawItem.subjectId);
+
+      if (kind === 'lessons') {
+        const title = String(rawItem.title ?? rawItem.tenBai ?? '').trim();
+        const unitTitle = String(rawItem.unitTitle ?? rawItem.chuDe ?? 'Chủ đề bổ sung').trim();
+        const coreKnowledge = String(rawItem.coreKnowledge ?? rawItem.kienThuc ?? '').trim();
+        if (!gradeMap.has(gradeLevel)) {
+          rowErrors.push({ row: rowNum, message: 'Lớp phải từ 1 đến 5.' });
+          return;
+        }
+        if (!subjectId) {
+          rowErrors.push({ row: rowNum, message: 'Không nhận diện được môn học (vd: math, vietnamese, science).' });
+          return;
+        }
+        if (!title || !coreKnowledge) {
+          rowErrors.push({ row: rowNum, message: 'Thiếu tên bài học (title) hoặc kiến thức trọng tâm (coreKnowledge).' });
+          return;
+        }
+        validRows.push({
+          ...rawItem,
+          gradeLevel,
+          gradeId: gradeMap.get(gradeLevel),
+          subjectId,
+          unitTitle,
+          title,
+          coreKnowledge,
+        });
+      } else if (kind === 'exercises') {
+        const title = String(rawItem.title ?? rawItem.tieuDe ?? '').trim();
+        const prompt = String(rawItem.prompt ?? rawItem.cauHoi ?? '').trim();
+        const correctAnswer = String(rawItem.correctAnswer ?? rawItem.dapAn ?? '').trim();
+        if (!gradeMap.has(gradeLevel) || !subjectId) {
+          rowErrors.push({ row: rowNum, message: 'Thiếu lớp (1–5) hoặc môn học hợp lệ.' });
+          return;
+        }
+        if (!title || !prompt || !correctAnswer) {
+          rowErrors.push({ row: rowNum, message: 'Thiếu tiêu đề (title), câu hỏi (prompt) hoặc đáp án đúng (correctAnswer).' });
+          return;
+        }
+        validRows.push({ ...rawItem, gradeId: gradeMap.get(gradeLevel), subjectId, title, prompt, correctAnswer });
+      } else {
+        const exerciseId = Number(rawItem.exerciseId ?? rawItem.maBaiTap);
+        const prompt = String(rawItem.prompt ?? rawItem.cauHoi ?? '').trim();
+        const correctAnswer = String(rawItem.correctAnswer ?? rawItem.dapAn ?? '').trim();
+        const exExists = exerciseId ? db.prepare('SELECT id FROM exercises WHERE id = ?').get(exerciseId) : null;
+        if (!exExists) {
+          rowErrors.push({ row: rowNum, message: `Không tìm thấy bài tập có ID ${rawItem.exerciseId ?? '?'}.` });
+          return;
+        }
+        if (!prompt || !correctAnswer) {
+          rowErrors.push({ row: rowNum, message: 'Thiếu nội dung câu hỏi (prompt) hoặc đáp án đúng (correctAnswer).' });
+          return;
+        }
+        validRows.push({ ...rawItem, exerciseId, prompt, correctAnswer });
+      }
+    });
+
+    if (validRows.length === 0) {
+      return res.status(400).json({
+        error: 'Không có dòng nào hợp lệ để import. Vui lòng kiểm tra danh sách lỗi bên dưới.',
+        errors: rowErrors,
+      });
+    }
+
+    const createdIds: number[] = [];
+    const tx = db.transaction(() => {
+      if (kind === 'lessons') {
+        const findUnit = db.prepare('SELECT id FROM curriculum_units WHERE grade_id = ? AND subject_id = ? AND title = ?');
+        const insUnit = db.prepare(
+          'INSERT INTO curriculum_units (grade_id, subject_id, semester, title, order_index, description) VALUES (?, ?, ?, ?, 99, ?)'
+        );
+        const insLesson = db.prepare(
+          `INSERT INTO lessons (unit_id, title, objectives, core_knowledge, illustration_url, examples_json, interactive_check_json, review_notes, status, review_status, is_ai_generated, created_by)
+           VALUES (?, ?, ?, ?, '/src/assets/images/hero_learning_world.webp', ?, ?, ?, 'draft', 'draft', 0, ?)`
+        );
+        for (const r of validRows) {
+          const gId = Number(r.gradeId);
+          const sId = Number(r.subjectId);
+          const uTitle = String(r.unitTitle);
+          let uRow = findUnit.get(gId, sId, uTitle) as { id: number } | undefined;
+          if (!uRow) {
+            const sem = Number(r.semester) === 2 ? 2 : 1;
+            const uId = Number(insUnit.run(gId, sId, sem, uTitle, String(r.unitDescription || uTitle)).lastInsertRowid);
+            uRow = { id: uId };
+          }
+          const examples = Array.isArray(r.examples)
+            ? r.examples
+            : String(r.examples || '')
+                .split('|')
+                .map((x) => x.trim())
+                .filter(Boolean);
+          const ic =
+            r.interactiveCheck && typeof r.interactiveCheck === 'object'
+              ? r.interactiveCheck
+              : r.checkQuestion
+              ? {
+                  question: String(r.checkQuestion),
+                  options: String(r.checkOptions || '')
+                    .split('|')
+                    .map((x) => x.trim())
+                    .filter(Boolean),
+                  answer: String(r.checkAnswer || ''),
+                  hint: String(r.checkHint || 'Đọc kỹ kiến thức trọng tâm nhé!'),
+                }
+              : {};
+          const lId = Number(
+            insLesson.run(
+              uRow.id,
+              String(r.title),
+              String(r.objectives || 'Hiểu và vận dụng kiến thức trọng tâm.'),
+              String(r.coreKnowledge),
+              JSON.stringify(examples),
+              JSON.stringify(ic),
+              String(r.reviewNotes || 'Ôn tập lại ví dụ cùng SOCO.'),
+              req.user!.id
+            ).lastInsertRowid
+          );
+          createdIds.push(lId);
+        }
+      } else if (kind === 'exercises') {
+        const insEx = db.prepare(
+          `INSERT INTO exercises (grade_id, subject_id, title, game_type, difficulty, xp_reward, review_status, is_ai_generated, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, 'draft', 0, ?)`
+        );
+        const insQ = db.prepare(
+          `INSERT INTO exercise_questions (exercise_id, question_type, prompt, options_json, correct_answer, explanation, order_index)
+           VALUES (?, ?, ?, ?, ?, ?, 1)`
+        );
+        for (const r of validRows) {
+          const validTypes = [
+            'quiz',
+            'matching',
+            'drag_drop',
+            'fill_blank',
+            'word_puzzle',
+            'math_challenge',
+            'picture_recognition',
+            'memory',
+            'true_false',
+            'interactive_story',
+          ];
+          const gType = validTypes.includes(String(r.gameType || '')) ? String(r.gameType) : 'quiz';
+          const diff = ['easy', 'medium', 'hard'].includes(String(r.difficulty || '')) ? String(r.difficulty) : 'medium';
+          const exId = Number(
+            insEx.run(Number(r.gradeId), Number(r.subjectId), String(r.title), gType, diff, Number(r.xpReward) || 35, req.user!.id)
+              .lastInsertRowid
+          );
+          const opts = Array.isArray(r.options)
+            ? r.options
+            : String(r.options || '')
+                .split('|')
+                .map((x) => x.trim())
+                .filter(Boolean);
+          insQ.run(
+            exId,
+            gType,
+            String(r.prompt),
+            JSON.stringify(opts),
+            String(r.correctAnswer),
+            String(r.explanation || 'Kiểm tra lại gợi ý trong bài học.')
+          );
+          createdIds.push(exId);
+        }
+      } else {
+        const insQ = db.prepare(
+          `INSERT INTO exercise_questions (exercise_id, question_type, prompt, options_json, correct_answer, explanation, order_index)
+           VALUES (?, 'quiz', ?, ?, ?, ?, ?)`
+        );
+        validRows.forEach((r, idx) => {
+          const opts = Array.isArray(r.options)
+            ? r.options
+            : String(r.options || '')
+                .split('|')
+                .map((x) => x.trim())
+                .filter(Boolean);
+          const qId = Number(
+            insQ.run(
+              Number(r.exerciseId),
+              String(r.prompt),
+              JSON.stringify(opts),
+              String(r.correctAnswer),
+              String(r.explanation || 'Giáo viên bổ sung câu hỏi.'),
+              idx + 1
+            ).lastInsertRowid
+          );
+          createdIds.push(qId);
+        });
+      }
+    });
+
+    tx();
+    res.status(201).json({
+      importedCount: createdIds.length,
+      errorCount: rowErrors.length,
+      errors: rowErrors,
+      createdIds,
+      message: `Đã import ${createdIds.length} mục ở trạng thái Nháp (Chờ duyệt → Đã duyệt → Xuất bản).${
+        rowErrors.length > 0 ? ` Có ${rowErrors.length} dòng bị bỏ qua do lỗi định dạng.` : ''
+      }`,
+    });
+  } catch (err: unknown) {
+    console.error('Bulk import error:', err instanceof Error ? err.message : String(err));
+    res.status(500).json({ error: 'Không thể hoàn tất import dữ liệu. Vui lòng kiểm tra lại định dạng tệp.' });
+  }
+});
+
+apiRouter.patch('/content/lessons/:id/review', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
+  const { reviewStatus } = req.body || {};
+  if (!['draft', 'approved', 'published', 'rejected'].includes(reviewStatus)) {
+    return res.status(400).json({ error: 'Trạng thái duyệt không hợp lệ.' });
+  }
+  const sqlStatus = reviewStatus === 'published' ? 'published' : 'draft';
+  db.prepare(`UPDATE lessons SET review_status = ?, status = ?, updated_at = datetime('now') WHERE id = ?`).run(
+    reviewStatus,
+    sqlStatus,
+    Number(req.params.id)
+  );
+  res.json({ message: `Đã chuyển trạng thái bài học sang "${reviewStatus}".` });
+});
+
+apiRouter.patch('/content/exercises/:id/review', authenticate, requireRole('teacher', 'admin'), (req: AuthRequest, res: Response) => {
+  const { reviewStatus } = req.body || {};
+  if (!['draft', 'approved', 'published', 'rejected'].includes(reviewStatus)) {
+    return res.status(400).json({ error: 'Trạng thái duyệt không hợp lệ.' });
+  }
+  db.prepare(`UPDATE exercises SET review_status = ?, updated_at = datetime('now') WHERE id = ?`).run(
+    reviewStatus,
+    Number(req.params.id)
+  );
+  res.json({ message: `Đã chuyển trạng thái bài tập sang "${reviewStatus}".` });
 });
 
 apiRouter.post('/teacher/ai-insights', authenticate, requireRole('teacher', 'admin'), async (req: AuthRequest, res: Response) => {
@@ -1368,7 +1779,7 @@ apiRouter.get('/parent/overview', authenticate, requireRole('parent', 'admin'), 
          WHERE sm.student_id = ?
          ORDER BY sm.mastery_score ASC`
       )
-      .all(sid);
+      .all(sid) as Array<{ subject_name: string; topic_name: string; mastery_score: number; confidence_level: string }>;
 
     const mistakes = db
       .prepare(
@@ -1378,9 +1789,43 @@ apiRouter.get('/parent/overview', authenticate, requireRole('parent', 'admin'), 
          WHERE lm.student_id = ? AND lm.resolved = 0
          ORDER BY lm.frequency DESC`
       )
-      .all(sid);
+      .all(sid) as Array<{ subject_name: string; topic_name: string; mistake_type: string; description: string }>;
 
-    return { ...child, stats, mastery, mistakes };
+    const weeklyRaw = db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(time_spent_seconds), 0) as week_seconds,
+           COUNT(CASE WHEN lesson_id IS NOT NULL AND status = 'completed' THEN 1 END) as week_lessons,
+           COUNT(CASE WHEN exercise_id IS NOT NULL AND status = 'completed' THEN 1 END) as week_games,
+           COALESCE(ROUND(AVG(CASE WHEN score > 0 THEN score END)), 0) as week_avg_score
+         FROM learning_progress
+         WHERE student_id = ? AND datetime(last_accessed_at) >= datetime('now', '-7 days')`
+      )
+      .get(sid) as { week_seconds: number; week_lessons: number; week_games: number; week_avg_score: number };
+
+    const weekTutorCount = (
+      db
+        .prepare(`SELECT COUNT(*) as cnt FROM tutoring_sessions WHERE student_id = ? AND datetime(updated_at) >= datetime('now', '-7 days')`)
+        .get(sid) as { cnt: number }
+    ).cnt;
+
+    const sortedDesc = [...mastery].sort((a, b) => b.mastery_score - a.mastery_score);
+    const weeklyReport = {
+      periodLabel: '7 ngày gần nhất',
+      studyMinutes7d: Math.round((weeklyRaw?.week_seconds || 0) / 60),
+      lessonsCompleted7d: weeklyRaw?.week_lessons || 0,
+      gamesCompleted7d: weeklyRaw?.week_games || 0,
+      tutorSessions7d: weekTutorCount,
+      avgScore7d: weeklyRaw?.week_avg_score || 0,
+      strongestTopics: sortedDesc.slice(0, 2).map((m) => `${m.subject_name}: ${m.topic_name} (${m.mastery_score}%)`),
+      focusTopics: mastery.slice(0, 2).map((m) => `${m.subject_name}: ${m.topic_name} (${m.mastery_score}%)`),
+      recommendation:
+        mistakes.length > 0
+          ? `Cùng con ôn nhẹ chủ đề "${mistakes[0].topic_name}" trong 10 phút mỗi tối qua ví dụ đời sống.`
+          : 'Con đang duy trì nhịp học tích cực! Phụ huynh có thể khen ngợi sự kiên trì và khuyến khích con kể lại 1 điều thú vị vừa học.',
+    };
+
+    return { ...child, stats, mastery, mistakes, weeklyReport };
   });
 
   res.json({ children });
@@ -1510,7 +1955,39 @@ apiRouter.get('/admin/overview', authenticate, requireRole('admin'), (_req: Auth
     )
     .all();
 
+  const lessons = db
+    .prepare(
+      `SELECT l.id, l.title, l.status, l.review_status, l.is_ai_generated, l.created_at,
+              cu.title as unit_title, g.level as grade_level, s.name as subject_name
+       FROM lessons l
+       JOIN curriculum_units cu ON l.unit_id = cu.id
+       JOIN grades g ON cu.grade_id = g.id
+       JOIN subjects s ON cu.subject_id = s.id
+       ORDER BY CASE l.review_status WHEN 'draft' THEN 0 WHEN 'approved' THEN 1 WHEN 'published' THEN 2 ELSE 3 END, l.id DESC
+       LIMIT 60`
+    )
+    .all();
+
+  const exercises = db
+    .prepare(
+      `SELECT e.id, e.title, e.game_type, e.difficulty, e.review_status, e.is_ai_generated, e.created_at,
+              g.level as grade_level, s.name as subject_name,
+              (SELECT COUNT(*) FROM exercise_questions eq WHERE eq.exercise_id = e.id) as question_count
+       FROM exercises e
+       JOIN grades g ON e.grade_id = g.id
+       JOIN subjects s ON e.subject_id = s.id
+       ORDER BY CASE e.review_status WHEN 'draft' THEN 0 WHEN 'approved' THEN 1 WHEN 'published' THEN 2 ELSE 3 END, e.id DESC`
+    )
+    .all();
+
   const settings = db.prepare('SELECT * FROM system_settings ORDER BY key ASC').all();
+  const retentionDays = Math.min(3650, Math.max(1, Number(getSetting('conversation_retention_days', '90')) || 90));
+  const expiredSessionCount = (
+    db
+      .prepare(`SELECT COUNT(*) as cnt FROM tutoring_sessions WHERE datetime(updated_at) < datetime('now', '-' || ? || ' days')`)
+      .get(retentionDays) as { cnt: number }
+  ).cnt;
+
   const aiLogs = db
     .prepare(
       `SELECT l.*, u.username, u.role
@@ -1521,7 +1998,17 @@ apiRouter.get('/admin/overview', authenticate, requireRole('admin'), (_req: Auth
     )
     .all();
 
-  res.json({ users, classes, materials, questions, settings, aiLogs });
+  res.json({
+    users,
+    classes,
+    materials,
+    questions,
+    lessons,
+    exercises,
+    settings,
+    retentionInfo: { retentionDays, expiredSessionCount },
+    aiLogs,
+  });
 });
 
 apiRouter.patch('/admin/users/:id', authenticate, requireRole('admin'), (req: AuthRequest, res: Response) => {
@@ -1559,6 +2046,22 @@ apiRouter.delete('/admin/questions/:id', authenticate, requireRole('admin'), (re
 apiRouter.patch('/admin/settings', authenticate, requireRole('admin'), (req: AuthRequest, res: Response) => {
   const { key, value } = req.body || {};
   if (!key || value === undefined) return res.status(400).json({ error: 'Thiếu thông số cấu hình.' });
-  db.prepare(`UPDATE system_settings SET value = ?, updated_at = datetime('now') WHERE key = ?`).run(String(value), String(key));
+  let normalizedVal = String(value).trim();
+  if (key === 'conversation_retention_days') {
+    const days = Math.round(Number(normalizedVal));
+    if (!Number.isFinite(days) || days < 1 || days > 3650) {
+      return res.status(400).json({ error: 'Số ngày lưu trữ hội thoại phải là số nguyên từ 1 đến 3650 ngày.' });
+    }
+    normalizedVal = String(days);
+  }
+  db.prepare(`UPDATE system_settings SET value = ?, updated_at = datetime('now') WHERE key = ?`).run(normalizedVal, String(key));
   res.json({ message: 'Đã lưu cấu hình hệ thống.' });
+});
+
+apiRouter.post('/admin/cleanup-conversations', authenticate, requireRole('admin'), (_req: AuthRequest, res: Response) => {
+  const result = cleanupExpiredConversations();
+  res.json({
+    ...result,
+    message: `Đã tự động xóa ${result.deletedCount} phiên hội thoại quá ${result.retentionDays} ngày theo chính sách dữ liệu trẻ em.`,
+  });
 });
