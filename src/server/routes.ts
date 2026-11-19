@@ -194,8 +194,9 @@ apiRouter.post('/auth/register', (req, res) => {
       user,
     });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
     const errMsg = err instanceof Error ? err.message : String(err);
-    console.error('Register error:', errMsg);
+    console.error(`Register error [${errName}]:`, errMsg);
     if (errMsg.includes('UNIQUE constraint failed: users.email')) {
       return res.status(409).json({ error: 'Email này đã được đăng ký.', code: 'EMAIL_EXISTS' });
     }
@@ -251,7 +252,9 @@ apiRouter.post('/auth/login', (req, res) => {
     const user = getFullUserPayload(userRow.id);
     res.json({ token, refreshToken, user });
   } catch (err: unknown) {
-    console.error('Login error:', err instanceof Error ? err.message : String(err));
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`Login error [${errName}]:`, errMsg);
     res.status(500).json({
       error: 'Hệ thống xác thực tạm thời gặp sự cố. Vui lòng thử lại sau ít phút.',
       code: 'DB_ERROR',
@@ -305,9 +308,19 @@ apiRouter.post('/auth/logout', (req, res) => {
 });
 
 apiRouter.get('/auth/me', authenticate, (req: AuthRequest, res: Response) => {
-  const user = getFullUserPayload(req.user!.id);
-  if (!user) return res.status(404).json({ error: 'Không tìm thấy tài khoản.', code: 'NOT_FOUND' });
-  res.json({ user });
+  try {
+    const user = getFullUserPayload(req.user!.id);
+    if (!user) return res.status(404).json({ error: 'Không tìm thấy tài khoản.', code: 'NOT_FOUND' });
+    res.json({ user });
+  } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`Auth me error [${errName}]:`, errMsg);
+    res.status(500).json({
+      error: 'Hệ thống xác thực tạm thời gặp sự cố khi tải hồ sơ.',
+      code: 'DB_ERROR',
+    });
+  }
 });
 
 apiRouter.post('/auth/verify', authenticate, (req: AuthRequest, res: Response) => {
@@ -978,8 +991,10 @@ apiRouter.post('/ai/tutor', authenticate, async (req: AuthRequest, res: Response
       user: getFullUserPayload(req.user!.id),
     });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = (err instanceof Error ? err.message : String(err)).replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]');
     const aiErr = classifyGeminiError(err);
-    console.error('Socratic tutor error:', aiErr.message);
+    console.error(`Socratic tutor error [${errName}] (${aiErr.code}):`, rawMsg);
     try {
       db.prepare(
         `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', 'gemini-4-hydrogen', 'error', ?)`

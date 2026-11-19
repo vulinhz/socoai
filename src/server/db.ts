@@ -5,11 +5,12 @@ import os from 'os';
 import path from 'path';
 import { seedGdpt2018Curriculum } from './curriculum_gdpt2018.ts';
 
-function resolveWritableDbPath(): string {
-  if (process.env.DATABASE_PATH) {
-    const customDir = path.dirname(path.resolve(process.env.DATABASE_PATH));
+function resolveWritableDbPath(): { dbPath: string; persistentStorage: boolean } {
+  if (process.env.DATABASE_PATH?.trim()) {
+    const customPath = path.resolve(process.env.DATABASE_PATH.trim());
+    const customDir = path.dirname(customPath);
     fs.mkdirSync(customDir, { recursive: true });
-    return path.resolve(process.env.DATABASE_PATH);
+    return { dbPath: customPath, persistentStorage: true };
   }
 
   const localDataDir = path.resolve(process.cwd(), 'data');
@@ -21,7 +22,7 @@ function resolveWritableDbPath(): string {
         fs.mkdirSync(localDataDir, { recursive: true });
       }
       fs.accessSync(localDataDir, fs.constants.W_OK);
-      return localDbPath;
+      return { dbPath: localDbPath, persistentStorage: true };
     } catch {
       // Fall through to writable temp directory
     }
@@ -39,11 +40,12 @@ function resolveWritableDbPath(): string {
       console.warn('Could not copy bundled database to temp dir, initializing fresh DB:', err);
     }
   }
-  return tmpDbPath;
+  return { dbPath: tmpDbPath, persistentStorage: false };
 }
 
-const dbPath = resolveWritableDbPath();
-export const db = new Database(dbPath);
+const resolvedStorage = resolveWritableDbPath();
+export const hasPersistentStorage = resolvedStorage.persistentStorage;
+export const db = new Database(resolvedStorage.dbPath);
 
 try {
   db.pragma('journal_mode = WAL');

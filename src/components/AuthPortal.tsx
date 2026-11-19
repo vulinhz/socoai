@@ -12,7 +12,7 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react';
-import { apiRequest, setAuthTokens, UserProfileData } from '../lib/api';
+import { ApiError, apiRequest, setAuthTokens, UserProfileData } from '../lib/api';
 import { heroLearningWorldImg } from '../lib/assets';
 import { usePageSeo } from '../lib/seo';
 import { SocoMascot } from './SocoMascot';
@@ -33,11 +33,13 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
   const [tab, setTab] = useState<AuthTab>(initialTab);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [errorCode, setErrorCode] = useState('');
   const [infoMsg, setInfoMsg] = useState(sessionMessage || '');
 
   useEffect(() => {
     setTab(initialTab);
     setError('');
+    setErrorCode('');
   }, [initialTab]);
 
   useEffect(() => {
@@ -82,6 +84,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
   function switchTab(nextTab: AuthTab) {
     setTab(nextTab);
     setError('');
+    setErrorCode('');
     if (nextTab === 'login') navigate('/dang-nhap');
     else if (nextTab === 'register') navigate('/dang-ky');
     else navigate('/quen-mat-khau');
@@ -90,6 +93,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    setErrorCode('');
     setInfoMsg('');
 
     const cleanIdentifier = loginId.trim();
@@ -108,6 +112,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
       onAuthenticated(data.user);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Đăng nhập không thành công.');
+      setErrorCode(err instanceof ApiError && err.code ? err.code : '');
     } finally {
       setLoading(false);
     }
@@ -116,6 +121,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
   async function handleRegister(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    setErrorCode('');
     setInfoMsg('');
 
     if (!acceptedTerms) {
@@ -169,6 +175,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
       onAuthenticated(data.user);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Đăng ký chưa thành công.');
+      setErrorCode(err instanceof ApiError && err.code ? err.code : '');
     } finally {
       setLoading(false);
     }
@@ -177,6 +184,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
   async function handleForgot(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    setErrorCode('');
     setInfoMsg('');
     setLoading(true);
     try {
@@ -199,6 +207,7 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Không thể khôi phục mật khẩu.');
+      setErrorCode(err instanceof ApiError && err.code ? err.code : '');
     } finally {
       setLoading(false);
     }
@@ -327,7 +336,10 @@ export function AuthPortal({ initialTab = 'login', onAuthenticated, sessionMessa
 
             {error && (
               <div role="alert" className="mt-4 p-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700 font-medium">
-                {error}
+                <p>{error}</p>
+                {errorCode && (
+                  <p className="mt-1 text-xs font-mono text-red-600/85">Mã lỗi: {errorCode}</p>
+                )}
               </div>
             )}
             {infoMsg && (

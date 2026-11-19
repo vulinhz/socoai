@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
-import { db } from './db.ts';
+import { db, hasPersistentStorage } from './db.ts';
+import { MODEL_NAME, testGeminiConnection } from './ai.ts';
 import { apiRouter } from './routes.ts';
 
 function normalizeOrigin(origin: string): string {
@@ -97,6 +98,7 @@ export function createApiApp() {
   app.get('/api/health', (_req: Request, res: Response) => {
     try {
       db.prepare('SELECT 1 AS ok').get();
+      const userCountRow = db.prepare('SELECT COUNT(*) AS cnt FROM users').get() as { cnt: number } | undefined;
       const geminiKey = process.env.GEMINI_API_KEY?.trim();
       const aiConfigured = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
       res.json({
@@ -104,15 +106,28 @@ export function createApiApp() {
         app: 'SOCRATES KIDS AI',
         db: 'connected',
         aiConfigured,
+        aiModel: MODEL_NAME,
+        persistentStorage: hasPersistentStorage,
+        userCount: Number(userCountRow?.cnt ?? 0),
       });
     } catch (err: unknown) {
-      console.error('Health check DB error:', err instanceof Error ? err.message : String(err));
+      const errName = err instanceof Error ? err.name : 'UnknownError';
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`Health check DB error [${errName}]:`, errMsg);
       res.status(503).json({
         status: 'error',
         error: 'Cơ sở dữ liệu tạm thời không khả dụng.',
         code: 'DB_UNAVAILABLE',
+        aiModel: MODEL_NAME,
+        persistentStorage: hasPersistentStorage,
+        userCount: null,
       });
     }
+  });
+
+  app.get('/api/health/ai', async (_req: Request, res: Response) => {
+    const result = await testGeminiConnection();
+    res.json(result);
   });
 
   app.use('/api', apiRouter);

@@ -78,7 +78,13 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     );
   }
 
-  if (lower.includes('not_found') || statusNum === 404 || (lower.includes('model') && lower.includes('not found'))) {
+  if (
+    lower.includes('not_found') ||
+    statusNum === 404 ||
+    lower.includes('is not found') ||
+    lower.includes('model not found') ||
+    (lower.includes('model') && (lower.includes('not found') || lower.includes('does not exist') || lower.includes('not supported')))
+  ) {
     return new AiServiceError(
       'GEMINI_MODEL_UNAVAILABLE',
       502,
@@ -145,8 +151,51 @@ function getAiClient() {
   });
 }
 
-const MODEL_NAME = 'gemini-4-hydrogen';
+export const MODEL_NAME = 'gemini-4-hydrogen';
 const DEFAULT_GEMINI_TIMEOUT_MS = 25000;
+
+export async function testGeminiConnection(): Promise<{
+  ok: boolean;
+  model: string;
+  code: string;
+  message: string;
+}> {
+  try {
+    const ai = getAiClient();
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: MODEL_NAME,
+        contents: 'Trả lời đúng 1 từ: OK',
+        config: {
+          maxOutputTokens: 16,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      }),
+      12000
+    );
+    const hasText = Boolean(response && typeof response.text === 'string' && response.text.trim().length > 0);
+    return {
+      ok: true,
+      model: MODEL_NAME,
+      code: 'OK',
+      message: hasText
+        ? 'Kết nối Gemini AI hoạt động bình thường.'
+        : 'Gemini AI đã phản hồi thành công.',
+    };
+  } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    const safeMsg = rawMsg.replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]');
+    console.error(`Health AI check error [${errName}]:`, safeMsg);
+    const aiErr = classifyGeminiError(err);
+    return {
+      ok: false,
+      model: MODEL_NAME,
+      code: aiErr.code,
+      message: aiErr.userMessage,
+    };
+  }
+}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_GEMINI_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
