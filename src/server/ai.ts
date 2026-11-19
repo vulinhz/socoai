@@ -51,17 +51,58 @@ function getRawErrorMessage(err: unknown): string {
   }
 }
 
+function getRawErrorStatus(err: unknown): number | undefined {
+  const errObj = err as { status?: number; statusCode?: number; response?: { status?: number } };
+  const s = errObj?.status ?? errObj?.statusCode ?? errObj?.response?.status;
+  return typeof s === 'number' && !Number.isNaN(s) ? s : undefined;
+}
+
+function isKeyOrQuotaError(aiErr: AiServiceError): boolean {
+  return (
+    aiErr.code === 'GEMINI_API_KEY_MISSING' ||
+    aiErr.code === 'GEMINI_API_KEY_INVALID' ||
+    aiErr.code === 'GEMINI_QUOTA_EXCEEDED'
+  );
+}
+
+export function parseLenientJson<T = Record<string, unknown>>(rawText: string): T | null {
+  if (!rawText || typeof rawText !== 'string') return null;
+  let cleaned = rawText.trim();
+  if (!cleaned) return null;
+
+  // Strip ```json ... ``` or ``` ... ``` markdown code fences
+  cleaned = cleaned
+    .replace(/^```(?:json)?\s*\n?/i, '')
+    .replace(/\n?\s*```$/i, '')
+    .trim();
+
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const slice = cleaned.slice(firstBrace, lastBrace + 1);
+      try {
+        return JSON.parse(slice) as T;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
 function isModelUnavailableError(err: unknown): boolean {
-  const errObj = err as { status?: number; message?: string };
   const rawMsg = getRawErrorMessage(err);
   const lower = rawMsg.toLowerCase();
-  const statusNum = Number(errObj?.status || 0);
+  const statusNum = Number(getRawErrorStatus(err) || 0);
   return (
     statusNum === 404 ||
     lower.includes('not_found') ||
     lower.includes('is not found') ||
     lower.includes('model not found') ||
-    lower.includes('models/') && lower.includes('not found') ||
+    (lower.includes('models/') && lower.includes('not found')) ||
     (lower.includes('model') &&
       (lower.includes('not found') ||
         lower.includes('does not exist') ||
@@ -217,9 +258,11 @@ function getAiClient() {
 
 const DEFAULT_MODEL_CANDIDATES = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 const DEFAULT_GEMINI_TIMEOUT_MS = 25000;
+const DEFAULT_MAX_RETRIES = 2;
 
 let rememberedWorkingModel: string | null = null;
 let lastSeenGeminiModelEnv: string | undefined = undefined;
+const modelsWithoutThinking = new Set<string>();
 
 export function getConfiguredModels(): string[] {
   const raw = process.env.GEMINI_MODEL?.trim();
@@ -233,7 +276,8 @@ export function getConfiguredModels(): string[] {
         .map((m) => m.trim())
         .filter(Boolean)
     : [];
-  const baseList = parsed.length > 0 ? Array.from(new Set(parsed)) : [...DEFAULT_MODEL_CANDIDATES];
+  // Always keep DEFAULT_MODEL_CANDIDATES as fallbacks after any GEMINI_MODEL entries
+  const baseList = Array.from(new Set([...parsed, ...DEFAULT_MODEL_CANDIDATES]));
   if (rememberedWorkingModel && baseList.includes(rememberedWorkingModel)) {
     return [rememberedWorkingModel, ...baseList.filter((m) => m !== rememberedWorkingModel)];
   }
@@ -242,6 +286,11 @@ export function getConfiguredModels(): string[] {
 
 export function getActiveAiModel(): string {
   return getConfiguredModels()[0];
+}
+
+export function getLastUsedAiModel(): string | null {
+  getConfiguredModels();
+  return rememberedWorkingModel;
 }
 
 export const MODEL_NAME = DEFAULT_MODEL_CANDIDATES[0];
@@ -262,23 +311,30 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_GEMINI_TI
   }
 }
 
-async function runWithTransientRetry<T>(fn: () => Promise<T>, timeoutMs: number, maxRetries: number): Promise<T> {
+async function runWithTransientRetry<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number,
+  maxRetries: number,
+  modelName: string
+): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i <= maxRetries; i++) {
     try {
       return await withTimeout(fn(), timeoutMs);
     } catch (err: unknown) {
       lastErr = err;
+      const errName = err instanceof Error ? err.name : 'UnknownError';
+      const errStatus = getRawErrorStatus(err);
+      const safeMsg = redactSecrets(getRawErrorMessage(err));
+      console.error(
+        `[Gemini Error] model=${modelName} attempt=${i + 1}/${maxRetries + 1} name=${errName} status=${errStatus ?? 'N/A'} message=${safeMsg}`
+      );
+
       if (isModelUnavailableError(err) || isThinkingConfigUnsupportedError(err)) {
         throw err;
       }
-      const classified = classifyGeminiError(err);
-      if (
-        classified.code === 'GEMINI_API_KEY_MISSING' ||
-        classified.code === 'GEMINI_API_KEY_INVALID' ||
-        classified.code === 'GEMINI_QUOTA_EXCEEDED' ||
-        classified.code === 'INVALID_IMAGE'
-      ) {
+      const classified = classifyGeminiError(err, modelName);
+      if (isKeyOrQuotaError(classified) || classified.code === 'INVALID_IMAGE') {
         throw err;
       }
       if (i < maxRetries) {
@@ -301,30 +357,48 @@ export async function generateContentWithFallback(options: {
     ((params: GenerateContentParameters) => getAiClient().models.generateContent(params));
   const candidates = getConfiguredModels();
   const timeoutMs = options.timeoutMs ?? DEFAULT_GEMINI_TIMEOUT_MS;
-  const maxRetries = options.maxRetries ?? 1;
+  const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
   let lastModelError: AiServiceError | null = null;
 
   for (const modelName of candidates) {
+    let requestConfig = options.config;
+    if (
+      requestConfig &&
+      'thinkingConfig' in requestConfig &&
+      requestConfig.thinkingConfig !== undefined &&
+      modelsWithoutThinking.has(modelName)
+    ) {
+      const { thinkingConfig: _omit, ...rest } = requestConfig;
+      requestConfig = rest;
+    }
+
     try {
       const response = await runWithTransientRetry(
         () =>
           invokeGenerate({
             model: modelName,
             contents: options.contents,
-            config: options.config,
+            config: requestConfig,
           }),
         timeoutMs,
-        maxRetries
+        maxRetries,
+        modelName
       );
       rememberedWorkingModel = modelName;
       return { response, modelUsed: modelName };
     } catch (err: unknown) {
       let currentErr = err;
 
-      if (options.config && 'thinkingConfig' in options.config && options.config.thinkingConfig !== undefined && isThinkingConfigUnsupportedError(err)) {
+      if (
+        requestConfig &&
+        'thinkingConfig' in requestConfig &&
+        requestConfig.thinkingConfig !== undefined &&
+        isThinkingConfigUnsupportedError(err)
+      ) {
+        modelsWithoutThinking.add(modelName);
         console.warn(`[AI] Model "${modelName}" rejected thinkingConfig, retrying once without thinkingConfig.`);
-        const { thinkingConfig: _removedThinking, ...configWithoutThinking } = options.config;
+        const { thinkingConfig: _removedThinking, ...configWithoutThinking } = requestConfig;
         try {
           const response = await runWithTransientRetry(
             () =>
@@ -334,7 +408,8 @@ export async function generateContentWithFallback(options: {
                 config: configWithoutThinking,
               }),
             timeoutMs,
-            maxRetries
+            maxRetries,
+            modelName
           );
           rememberedWorkingModel = modelName;
           return { response, modelUsed: modelName };
@@ -373,12 +448,11 @@ export async function testGeminiConnection(): Promise<{
 }> {
   try {
     const { response, modelUsed } = await generateContentWithFallback({
-      contents: 'Trả lời đúng 1 từ: OK',
+      contents: 'Trả lời đúng một từ: OK',
       config: {
-        maxOutputTokens: 128,
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       },
-      timeoutMs: 12000,
+      timeoutMs: 25000,
       maxRetries: 0,
     });
     const hasText = Boolean(response && typeof response.text === 'string' && response.text.trim().length > 0);
@@ -392,8 +466,9 @@ export async function testGeminiConnection(): Promise<{
     };
   } catch (err: unknown) {
     const errName = err instanceof Error ? err.name : 'UnknownError';
+    const errStatus = getRawErrorStatus(err);
     const rawMsg = redactSecrets(getRawErrorMessage(err));
-    console.error(`Health AI check error [${errName}]:`, rawMsg);
+    console.error(`[Health AI Error] name=${errName} status=${errStatus ?? 'N/A'} message=${rawMsg}`);
     const aiErr = classifyGeminiError(err);
     return {
       ok: false,
@@ -493,85 +568,144 @@ Hãy kiểm tra bức ảnh được gửi lên:
 4. Phân loại môn học (detectedSubject) thuộc chương trình tiểu học Việt Nam (Toán học, Tiếng Việt, Tự nhiên & Khoa học, Tiếng Anh, Đạo đức & Kỹ năng, Lịch sử & Địa lí, Tin học & Công nghệ), lớp dự kiến (detectedGrade từ 1 đến 5, tham khảo gợi ý lớp ${gradeHint || 4}), chủ đề (topic), và loại nội dung (problemType).
 ${subjectHint ? `Gợi ý môn từ học sinh: ${subjectHint}.` : ''}`;
 
-  const { response, modelUsed } = await generateContentWithFallback({
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType: resolvedMimeType,
-            data: cleanBase64,
+  const imagePart = {
+    inlineData: {
+      mimeType: resolvedMimeType,
+      data: cleanBase64,
+    },
+  };
+
+  try {
+    const { response, modelUsed } = await generateContentWithFallback({
+      contents: {
+        parts: [imagePart, { text: prompt }],
+      },
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            isReadable: { type: Type.BOOLEAN },
+            safetyPassed: { type: Type.BOOLEAN },
+            extractedText: { type: Type.STRING },
+            detectedSubject: { type: Type.STRING },
+            detectedGrade: { type: Type.INTEGER },
+            topic: { type: Type.STRING },
+            problemType: { type: Type.STRING },
+            readabilityFeedback: { type: Type.STRING },
           },
+          required: [
+            'isReadable',
+            'safetyPassed',
+            'extractedText',
+            'detectedSubject',
+            'detectedGrade',
+            'topic',
+            'problemType',
+            'readabilityFeedback',
+          ],
         },
-        { text: prompt },
-      ],
+      },
+    });
+
+    const rawText = (response.text ?? '').trim();
+    const parsed = parseLenientJson<Omit<ScanProblemResult, 'modelUsed'>>(rawText);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        isReadable: Boolean(parsed.isReadable),
+        safetyPassed: parsed.safetyPassed !== false,
+        extractedText: parsed.extractedText || '',
+        detectedSubject: parsed.detectedSubject || subjectHint || 'Toán học',
+        detectedGrade: Math.min(5, Math.max(1, Number(parsed.detectedGrade) || gradeHint || 4)),
+        topic: parsed.topic || 'Bài tập từ ảnh chụp',
+        problemType: (['text', 'formula', 'table', 'diagram', 'mixed'].includes(parsed.problemType)
+          ? parsed.problemType
+          : 'text') as ScanProblemResult['problemType'],
+        readabilityFeedback: parsed.readabilityFeedback || '',
+        modelUsed,
+      };
+    }
+
+    // If model returned plain text instead of valid JSON, treat non-empty text directly as extractedText
+    const cleanedPlain = rawText
+      .replace(/^```(?:json|text)?\s*\n?/i, '')
+      .replace(/\n?\s*```$/i, '')
+      .trim();
+    if (cleanedPlain && !cleanedPlain.startsWith('{')) {
+      return {
+        isReadable: true,
+        safetyPassed: true,
+        extractedText: cleanedPlain,
+        detectedSubject: subjectHint || 'Toán học',
+        detectedGrade: Math.min(5, Math.max(1, Number(gradeHint) || 4)),
+        topic: 'Bài tập từ ảnh chụp',
+        problemType: 'text',
+        readabilityFeedback: '',
+        modelUsed,
+      };
+    }
+    console.warn('[AI] OCR JSON parse returned empty/invalid payload, falling back to plain-text OCR.');
+  } catch (err: unknown) {
+    const aiErr = classifyGeminiError(err);
+    if (isKeyOrQuotaError(aiErr) || aiErr.code === 'INVALID_IMAGE') {
+      throw aiErr;
+    }
+    console.warn(`[AI] Structured OCR failed (${aiErr.code}), falling back to plain-text OCR.`);
+  }
+
+  // Fallback: plain-text OCR without responseSchema / responseMimeType
+  const plainOcrPrompt = `Hãy đọc và chép lại chính xác toàn bộ nội dung đề bài tiểu học (tiếng Việt có dấu, phép tính, số liệu) trong bức ảnh này.
+Nếu ảnh quá mờ, không có chữ hoặc không phải bài học, chỉ trả lời đúng một từ: UNREADABLE.
+Nếu ảnh có nội dung bạo lực hoặc không an toàn cho trẻ em, chỉ trả lời đúng một từ: UNSAFE.`;
+
+  const { response: plainResp, modelUsed: plainModel } = await generateContentWithFallback({
+    contents: {
+      parts: [imagePart, { text: plainOcrPrompt }],
     },
     config: {
       thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          isReadable: { type: Type.BOOLEAN },
-          safetyPassed: { type: Type.BOOLEAN },
-          extractedText: { type: Type.STRING },
-          detectedSubject: { type: Type.STRING },
-          detectedGrade: { type: Type.INTEGER },
-          topic: { type: Type.STRING },
-          problemType: { type: Type.STRING },
-          readabilityFeedback: { type: Type.STRING },
-        },
-        required: [
-          'isReadable',
-          'safetyPassed',
-          'extractedText',
-          'detectedSubject',
-          'detectedGrade',
-          'topic',
-          'problemType',
-          'readabilityFeedback',
-        ],
-      },
     },
   });
 
-  const rawText = (response.text ?? '').trim();
-  if (!rawText) {
-    throw new AiServiceError(
-      'GEMINI_UPSTREAM_ERROR',
-      502,
-      'SOCO chưa đọc được chữ trong ảnh lần này. Em hãy thử chụp lại ảnh rõ nét hơn nhé!',
-      'EMPTY_OCR_RESPONSE',
-      'AI không trả về nội dung nhận dạng.',
-      modelUsed
-    );
+  const plainText = (plainResp.text ?? '').trim();
+  if (!plainText || plainText.toUpperCase() === 'UNREADABLE') {
+    return {
+      isReadable: false,
+      safetyPassed: true,
+      extractedText: '',
+      detectedSubject: subjectHint || 'Toán học',
+      detectedGrade: Math.min(5, Math.max(1, Number(gradeHint) || 4)),
+      topic: 'Bài tập từ ảnh chụp',
+      problemType: 'text',
+      readabilityFeedback: 'SOCO chưa nhìn rõ đề bài trong ảnh. Em hãy chụp lại ở nơi đủ sáng và giữ thẳng máy nhé!',
+      modelUsed: plainModel,
+    };
   }
-
-  let parsed: Omit<ScanProblemResult, 'modelUsed'>;
-  try {
-    parsed = JSON.parse(rawText) as Omit<ScanProblemResult, 'modelUsed'>;
-  } catch {
-    throw new AiServiceError(
-      'GEMINI_UPSTREAM_ERROR',
-      502,
-      'SOCO chưa đọc được rõ đề bài trong ảnh này. Em hãy thử quét lại nhé!',
-      'INVALID_JSON_OCR_RESPONSE',
-      'Dữ liệu nhận dạng từ AI chưa đúng định dạng JSON.',
-      modelUsed
-    );
+  if (plainText.toUpperCase() === 'UNSAFE') {
+    return {
+      isReadable: false,
+      safetyPassed: false,
+      extractedText: '',
+      detectedSubject: subjectHint || 'Toán học',
+      detectedGrade: Math.min(5, Math.max(1, Number(gradeHint) || 4)),
+      topic: 'Bài tập từ ảnh chụp',
+      problemType: 'text',
+      readabilityFeedback: 'Hình ảnh chưa phù hợp với nội dung học tập tiểu học.',
+      modelUsed: plainModel,
+    };
   }
 
   return {
-    isReadable: Boolean(parsed.isReadable),
-    safetyPassed: parsed.safetyPassed !== false,
-    extractedText: parsed.extractedText || '',
-    detectedSubject: parsed.detectedSubject || subjectHint || 'Toán học',
-    detectedGrade: Math.min(5, Math.max(1, Number(parsed.detectedGrade) || gradeHint || 4)),
-    topic: parsed.topic || 'Bài tập từ ảnh chụp',
-    problemType: (['text', 'formula', 'table', 'diagram', 'mixed'].includes(parsed.problemType)
-      ? parsed.problemType
-      : 'text') as ScanProblemResult['problemType'],
-    readabilityFeedback: parsed.readabilityFeedback || '',
-    modelUsed,
+    isReadable: true,
+    safetyPassed: true,
+    extractedText: plainText,
+    detectedSubject: subjectHint || 'Toán học',
+    detectedGrade: Math.min(5, Math.max(1, Number(gradeHint) || 4)),
+    topic: 'Bài tập từ ảnh chụp',
+    problemType: 'text',
+    readabilityFeedback: '',
+    modelUsed: plainModel,
   };
 }
 
@@ -657,8 +791,48 @@ function getModeInstructions(mode: string, hintLevel: number, revealSolutionRequ
 - Đánh giá câu trả lời của học sinh nếu có, sau đó đưa ra hoặc điều chỉnh độ khó của bài tập tương tự giúp học sinh tự vận dụng kiến thức vừa học.`;
 }
 
+function buildSocraticOutputFromPartial(
+  parsed: Partial<Omit<SocraticTurnOutput, 'modelUsed'>>,
+  input: SocraticTurnInput,
+  modelUsed: string,
+  fallbackReplyText?: string
+): SocraticTurnOutput {
+  const validEmotions = ['happy', 'thinking', 'cheering', 'explaining'];
+  const validDiff = ['easy', 'medium', 'hard'];
+  const replyText =
+    (typeof parsed.reply === 'string' && parsed.reply.trim()) ||
+    (fallbackReplyText && fallbackReplyText.trim()) ||
+    'SOCO đang lắng nghe em đây! Em có thể nói thêm một chút về điều em đang nghĩ không?';
+
+  return {
+    reply: replyText,
+    socoEmotion: (parsed.socoEmotion && validEmotions.includes(parsed.socoEmotion)
+      ? parsed.socoEmotion
+      : 'explaining') as SocraticTurnOutput['socoEmotion'],
+    pedagogicalAnalysis: {
+      questionGoal: parsed.pedagogicalAnalysis?.questionGoal || 'Gợi mở tư duy từng bước',
+      testedSkill: parsed.pedagogicalAnalysis?.testedSkill || input.topic,
+      understandingLevel: Math.min(5, Math.max(1, Number(parsed.pedagogicalAnalysis?.understandingLevel) || 3)),
+      detectedMistake: parsed.pedagogicalAnalysis?.detectedMistake || '',
+      mistakeCategory: parsed.pedagogicalAnalysis?.mistakeCategory || '',
+      nextStepHint: parsed.pedagogicalAnalysis?.nextStepHint || '',
+    },
+    detectedSubject: parsed.detectedSubject || input.subjectName,
+    topic: parsed.topic || input.topic,
+    learningObjective: parsed.learningObjective || 'Hiểu bản chất kiến thức và tự tìm lời giải',
+    difficulty: (parsed.difficulty && validDiff.includes(parsed.difficulty)
+      ? parsed.difficulty
+      : 'medium') as SocraticTurnOutput['difficulty'],
+    prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.slice(0, 4) : [],
+    isSolvedByStudent: Boolean(parsed.isSolvedByStudent),
+    similarChallengeProblem: parsed.similarChallengeProblem || '',
+    safetyFlagged: Boolean(parsed.safetyFlagged),
+    modelUsed,
+  };
+}
+
 export async function generateSocraticTurn(input: SocraticTurnInput): Promise<SocraticTurnOutput> {
-  const systemInstruction = `Bạn là SOCO, người bạn đồng hành học tập thông minh của học sinh tiểu học Việt Nam từ lớp 1 đến lớp 5 thuộc nền tảng SOCRATES KIDS AI.
+  const coreRules = `Bạn là SOCO, người bạn đồng hành học tập thông minh của học sinh tiểu học Việt Nam từ lớp 1 đến lớp 5 thuộc nền tảng SOCRATES KIDS AI.
 Bạn KHÔNG phải là công cụ giải bài tập tự động. Sứ mệnh của bạn là giúp học sinh TỰ KHÁM PHÁ KIẾN THỨC.
 
 15 NGUYÊN TẮC CỐT LÕI:
@@ -674,19 +848,24 @@ Bạn KHÔNG phải là công cụ giải bài tập tự động. Sứ mệnh c
 10. Không bịa kiến thức.
 11. Không tự nhận mình là giáo viên hay con người thật (luôn là bạn đồng hành AI SOCO).
 12. Không yêu cầu học sinh tiết lộ thông tin cá nhân (địa chỉ, số điện thoại, mật khẩu...).
-13. AN TOÀN TRẺ EM: Nếu học sinh hỏi nội dung bạo lực, nhạy cảm, tự làm hại hoặc vượt ngoài mục đích giáo dục tiểu học phù hợp, đặt safetyFlagged = true và nhẹ nhàng hướng em trao đổi với bố mẹ hoặc thầy cô đáng tin cậy.
+13. AN TOÀN TRẺ EM: Nếu học sinh hỏi nội dung bạo lực, nhạy cảm, tự làm hại hoặc vượt ngoài mục đích giáo dục tiểu học phù hợp, đặt safetyFlagged = true và nhẹ nhàng hướng em trao đổi với bố mẹ hoặc thầy cô đáng tin cậy.`;
+
+  const gradeGuide = getGradeDifferentiationGuide(input.gradeLevel);
+  const modeGuide = getModeInstructions(input.mode, input.hintLevel, input.revealSolutionRequested);
+
+  const systemInstructionJson = `${coreRules}
 14. Không để lộ suy luận nội bộ; chỉ xuất kết quả JSON đúng schema.
 
-${getGradeDifferentiationGuide(input.gradeLevel)}
+${gradeGuide}
 
-${getModeInstructions(input.mode, input.hintLevel, input.revealSolutionRequested)}`;
+${modeGuide}`;
 
   const historyText = input.history
     .slice(-10)
     .map((m) => `${m.sender === 'student' ? 'Học sinh' : 'SOCO'}: ${m.content}`)
     .join('\n');
 
-  const prompt = `Ngữ cảnh phiên học:
+  const baseContext = `Ngữ cảnh phiên học:
 - Môn học: ${input.subjectName}
 - Lớp: Lớp ${input.gradeLevel}
 - Chủ đề: ${input.topic}
@@ -696,83 +875,126 @@ Lịch sử hội thoại gần nhất:
 ${historyText || '(Bắt đầu cuộc trò chuyện mới)'}
 
 Tin nhắn mới của học sinh:
-"${input.studentMessage}"
+"${input.studentMessage}"`;
+
+  const jsonPrompt = `${baseContext}
 
 Hãy phản hồi sư phạm chuẩn mực và trả về JSON đầy đủ các trường theo schema.`;
 
-  const { response, modelUsed } = await generateContentWithFallback({
-    contents: prompt,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          reply: { type: Type.STRING },
-          socoEmotion: { type: Type.STRING },
-          pedagogicalAnalysis: {
-            type: Type.OBJECT,
-            properties: {
-              questionGoal: { type: Type.STRING },
-              testedSkill: { type: Type.STRING },
-              understandingLevel: { type: Type.INTEGER },
-              detectedMistake: { type: Type.STRING },
-              mistakeCategory: { type: Type.STRING },
-              nextStepHint: { type: Type.STRING },
+  try {
+    const { response, modelUsed } = await generateContentWithFallback({
+      contents: jsonPrompt,
+      config: {
+        systemInstruction: systemInstructionJson,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            reply: { type: Type.STRING },
+            socoEmotion: { type: Type.STRING },
+            pedagogicalAnalysis: {
+              type: Type.OBJECT,
+              properties: {
+                questionGoal: { type: Type.STRING },
+                testedSkill: { type: Type.STRING },
+                understandingLevel: { type: Type.INTEGER },
+                detectedMistake: { type: Type.STRING },
+                mistakeCategory: { type: Type.STRING },
+                nextStepHint: { type: Type.STRING },
+              },
+              required: ['questionGoal', 'testedSkill', 'understandingLevel', 'detectedMistake', 'mistakeCategory', 'nextStepHint'],
             },
-            required: ['questionGoal', 'testedSkill', 'understandingLevel', 'detectedMistake', 'mistakeCategory', 'nextStepHint'],
+            detectedSubject: { type: Type.STRING },
+            topic: { type: Type.STRING },
+            learningObjective: { type: Type.STRING },
+            difficulty: { type: Type.STRING },
+            prerequisites: { type: Type.ARRAY, items: { type: Type.STRING } },
+            isSolvedByStudent: { type: Type.BOOLEAN },
+            similarChallengeProblem: { type: Type.STRING },
+            safetyFlagged: { type: Type.BOOLEAN },
           },
-          detectedSubject: { type: Type.STRING },
-          topic: { type: Type.STRING },
-          learningObjective: { type: Type.STRING },
-          difficulty: { type: Type.STRING },
-          prerequisites: { type: Type.ARRAY, items: { type: Type.STRING } },
-          isSolvedByStudent: { type: Type.BOOLEAN },
-          similarChallengeProblem: { type: Type.STRING },
-          safetyFlagged: { type: Type.BOOLEAN },
+          required: [
+            'reply',
+            'socoEmotion',
+            'pedagogicalAnalysis',
+            'detectedSubject',
+            'topic',
+            'learningObjective',
+            'difficulty',
+            'prerequisites',
+            'isSolvedByStudent',
+            'similarChallengeProblem',
+            'safetyFlagged',
+          ],
         },
-        required: [
-          'reply',
-          'socoEmotion',
-          'pedagogicalAnalysis',
-          'detectedSubject',
-          'topic',
-          'learningObjective',
-          'difficulty',
-          'prerequisites',
-          'isSolvedByStudent',
-          'similarChallengeProblem',
-          'safetyFlagged',
-        ],
       },
+    });
+
+    const rawText = (response.text ?? '').trim();
+    const parsed = parseLenientJson<Partial<Omit<SocraticTurnOutput, 'modelUsed'>>>(rawText);
+    if (parsed && typeof parsed === 'object' && typeof parsed.reply === 'string' && parsed.reply.trim()) {
+      return buildSocraticOutputFromPartial(parsed, input, modelUsed);
+    }
+
+    // If JSON parsing failed or reply is missing, recover plain cleaned text if meaningful
+    const cleanedPlain = rawText
+      .replace(/^```(?:json|text)?\s*\n?/i, '')
+      .replace(/\n?\s*```$/i, '')
+      .trim();
+    if (cleanedPlain && !cleanedPlain.startsWith('{')) {
+      console.warn('[AI] Structured Socratic response returned plain text; using cleaned text directly.');
+      return buildSocraticOutputFromPartial({}, input, modelUsed, cleanedPlain);
+    }
+
+    console.warn('[AI] Structured Socratic JSON invalid or empty reply; falling back to plain-text Socratic call.');
+  } catch (err: unknown) {
+    const aiErr = classifyGeminiError(err);
+    if (isKeyOrQuotaError(aiErr)) {
+      throw aiErr;
+    }
+    console.warn(`[AI] Structured Socratic call failed (${aiErr.code}); falling back to plain-text Socratic call.`);
+  }
+
+  // Plain-text fallback without responseSchema / responseMimeType
+  const systemInstructionPlain = `${coreRules}
+14. Không để lộ suy luận nội bộ; chỉ trả lời trực tiếp bằng văn bản tiếng Việt tự nhiên, ấm áp cho học sinh (KHÔNG xuất JSON, KHÔNG bọc markdown code block).
+
+${gradeGuide}
+
+${modeGuide}`;
+
+  const plainPrompt = `${baseContext}
+
+Hãy viết câu trả lời sư phạm của SOCO bằng tiếng Việt tự nhiên để dẫn dắt học sinh.`;
+
+  const { response: plainResponse, modelUsed: plainModelUsed } = await generateContentWithFallback({
+    contents: plainPrompt,
+    config: {
+      systemInstruction: systemInstructionPlain,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
     },
   });
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as Omit<SocraticTurnOutput, 'modelUsed'>;
-  const validEmotions = ['happy', 'thinking', 'cheering', 'explaining'];
-  const validDiff = ['easy', 'medium', 'hard'];
-  return {
-    reply: parsed.reply || 'SOCO đang lắng nghe em đây! Em có thể nói thêm một chút về điều em đang nghĩ không?',
-    socoEmotion: (validEmotions.includes(parsed.socoEmotion) ? parsed.socoEmotion : 'explaining') as SocraticTurnOutput['socoEmotion'],
-    pedagogicalAnalysis: {
-      questionGoal: parsed.pedagogicalAnalysis?.questionGoal || 'Gợi mở tư duy từng bước',
-      testedSkill: parsed.pedagogicalAnalysis?.testedSkill || input.topic,
-      understandingLevel: Math.min(5, Math.max(1, Number(parsed.pedagogicalAnalysis?.understandingLevel) || 3)),
-      detectedMistake: parsed.pedagogicalAnalysis?.detectedMistake || '',
-      mistakeCategory: parsed.pedagogicalAnalysis?.mistakeCategory || '',
-      nextStepHint: parsed.pedagogicalAnalysis?.nextStepHint || '',
-    },
-    detectedSubject: parsed.detectedSubject || input.subjectName,
-    topic: parsed.topic || input.topic,
-    learningObjective: parsed.learningObjective || 'Hiểu bản chất kiến thức và tự tìm lời giải',
-    difficulty: (validDiff.includes(parsed.difficulty) ? parsed.difficulty : 'medium') as SocraticTurnOutput['difficulty'],
-    prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.slice(0, 4) : [],
-    isSolvedByStudent: Boolean(parsed.isSolvedByStudent),
-    similarChallengeProblem: parsed.similarChallengeProblem || '',
-    safetyFlagged: Boolean(parsed.safetyFlagged),
-    modelUsed,
-  };
+  const plainText = (plainResponse.text ?? '').trim();
+  if (!plainText) {
+    throw new AiServiceError(
+      'GEMINI_UPSTREAM_ERROR',
+      502,
+      'Kết nối với bạn SOCO đang tạm chập chờn. Em hãy thử gửi lại sau ít phút nhé!',
+      'EMPTY_SOCRATIC_PLAIN_RESPONSE',
+      'AI không trả về nội dung phản hồi.',
+      plainModelUsed
+    );
+  }
+
+  // Just in case model still wrapped a JSON block in plain mode
+  const maybeJson = parseLenientJson<Partial<Omit<SocraticTurnOutput, 'modelUsed'>>>(plainText);
+  if (maybeJson && typeof maybeJson.reply === 'string' && maybeJson.reply.trim()) {
+    return buildSocraticOutputFromPartial(maybeJson, input, plainModelUsed);
+  }
+
+  return buildSocraticOutputFromPartial({}, input, plainModelUsed, plainText);
 }
 
 export async function generateParentCompanionAdvice(params: {
@@ -818,11 +1040,15 @@ Hãy viết bằng Tiếng Việt ấm áp, không gây áp lực điểm số:
       },
     },
   });
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-    summary: string;
-    homeActivities: Array<{ title: string; duration: string; howTo: string }>;
+  const parsed = parseLenientJson<{
+    summary?: string;
+    homeActivities?: Array<{ title: string; duration: string; howTo: string }>;
+  }>(response.text ?? '');
+  return {
+    summary: parsed?.summary || (response.text ?? '').trim() || 'Em đang chăm chỉ tiến bộ từng ngày!',
+    homeActivities: Array.isArray(parsed?.homeActivities) ? parsed.homeActivities : [],
+    modelUsed,
   };
-  return { ...parsed, modelUsed };
 }
 
 export async function generateTeacherClassInsights(params: {
@@ -856,8 +1082,12 @@ Hãy đề xuất ngắn gọn bằng Tiếng Việt:
       },
     },
   });
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as { overview: string; actionPlan: string[] };
-  return { ...parsed, modelUsed };
+  const parsed = parseLenientJson<{ overview?: string; actionPlan?: string[] }>(response.text ?? '');
+  return {
+    overview: parsed?.overview || (response.text ?? '').trim() || 'Lớp học đang duy trì nhịp độ rèn luyện tích cực.',
+    actionPlan: Array.isArray(parsed?.actionPlan) ? parsed.actionPlan : [],
+    modelUsed,
+  };
 }
 
 export async function generateTeacherExerciseDraft(params: {
@@ -922,15 +1152,16 @@ Yêu cầu nghiêm ngặt:
     },
   });
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-    title?: string;
-    questions?: Array<{
-      prompt?: string;
-      options?: string[];
-      correctAnswer?: string;
-      explanation?: string;
-    }>;
-  };
+  const parsed =
+    parseLenientJson<{
+      title?: string;
+      questions?: Array<{
+        prompt?: string;
+        options?: string[];
+        correctAnswer?: string;
+        explanation?: string;
+      }>;
+    }>(response.text ?? '') || {};
 
   const sanitizedQuestions = (Array.isArray(parsed.questions) ? parsed.questions : [])
     .slice(0, count)

@@ -729,10 +729,12 @@ apiRouter.post('/ai/scan-problem', authenticate, async (req: AuthRequest, res: R
 
     res.json({ result });
   } catch (err: unknown) {
+    const errObj = err as { status?: number; statusCode?: number; response?: { status?: number } };
     const errName = err instanceof Error ? err.name : 'UnknownError';
+    const errStatus = errObj?.status ?? errObj?.statusCode ?? errObj?.response?.status;
     const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error(`Scan problem error [${errName}] (${aiErr.code}):`, rawMsg);
+    console.error(`[Scan Problem Error] name=${errName} status=${errStatus ?? aiErr.status} code=${aiErr.code} message=${rawMsg}`);
     try {
       db.prepare(
         `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/scan-problem', ?, 'error', ?)`
@@ -995,10 +997,12 @@ apiRouter.post('/ai/tutor', authenticate, async (req: AuthRequest, res: Response
       user: getFullUserPayload(req.user!.id),
     });
   } catch (err: unknown) {
+    const errObj = err as { status?: number; statusCode?: number; response?: { status?: number } };
     const errName = err instanceof Error ? err.name : 'UnknownError';
+    const errStatus = errObj?.status ?? errObj?.statusCode ?? errObj?.response?.status;
     const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error(`Socratic tutor error [${errName}] (${aiErr.code}):`, rawMsg);
+    console.error(`[Tutor Error] name=${errName} status=${errStatus ?? aiErr.status} code=${aiErr.code} message=${rawMsg}`);
     try {
       db.prepare(
         `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', ?, 'error', ?)`

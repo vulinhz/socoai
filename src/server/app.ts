@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
 import { db, hasPersistentStorage } from './db.ts';
-import { getActiveAiModel, testGeminiConnection } from './ai.ts';
+import { getActiveAiModel, getLastUsedAiModel, testGeminiConnection } from './ai.ts';
 import { apiRouter } from './routes.ts';
 
 function normalizeOrigin(origin: string): string {
@@ -107,6 +107,7 @@ export function createApiApp() {
         db: 'connected',
         aiConfigured,
         aiModel: getActiveAiModel(),
+        lastUsedModel: getLastUsedAiModel(),
         persistentStorage: hasPersistentStorage,
         userCount: Number(userCountRow?.cnt ?? 0),
       });
@@ -119,6 +120,7 @@ export function createApiApp() {
         error: 'Cơ sở dữ liệu tạm thời không khả dụng.',
         code: 'DB_UNAVAILABLE',
         aiModel: getActiveAiModel(),
+        lastUsedModel: getLastUsedAiModel(),
         persistentStorage: hasPersistentStorage,
         userCount: null,
       });
