@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
 import { db, hasPersistentStorage } from './db.ts';
-import { MODEL_NAME, testGeminiConnection } from './ai.ts';
+import { getActiveAiModel, testGeminiConnection } from './ai.ts';
 import { apiRouter } from './routes.ts';
 
 function normalizeOrigin(origin: string): string {
@@ -106,7 +106,7 @@ export function createApiApp() {
         app: 'SOCRATES KIDS AI',
         db: 'connected',
         aiConfigured,
-        aiModel: MODEL_NAME,
+        aiModel: getActiveAiModel(),
         persistentStorage: hasPersistentStorage,
         userCount: Number(userCountRow?.cnt ?? 0),
       });
@@ -118,7 +118,7 @@ export function createApiApp() {
         status: 'error',
         error: 'Cơ sở dữ liệu tạm thời không khả dụng.',
         code: 'DB_UNAVAILABLE',
-        aiModel: MODEL_NAME,
+        aiModel: getActiveAiModel(),
         persistentStorage: hasPersistentStorage,
         userCount: null,
       });

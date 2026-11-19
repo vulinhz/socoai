@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel, GenerateContentParameters, GenerateContentResponse } from '@google/genai';
 
 export type AiErrorCode =
   | 'GEMINI_API_KEY_MISSING'
@@ -13,34 +13,88 @@ export class AiServiceError extends Error {
   code: AiErrorCode;
   status: number;
   userMessage: string;
+  diagnosticMessage: string;
+  modelUsed?: string;
 
-  constructor(code: AiErrorCode, status: number, userMessage: string, technicalDetail?: string) {
+  constructor(
+    code: AiErrorCode,
+    status: number,
+    userMessage: string,
+    technicalDetail?: string,
+    diagnosticMessage?: string,
+    modelUsed?: string
+  ) {
     super(technicalDetail ? `${code}: ${technicalDetail}` : code);
     this.name = 'AiServiceError';
     this.code = code;
     this.status = status;
     this.userMessage = userMessage;
+    this.diagnosticMessage = diagnosticMessage || userMessage;
+    this.modelUsed = modelUsed;
   }
 }
 
-export function classifyGeminiError(err: unknown): AiServiceError {
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]')
+    .replace(/(GEMINI_API_KEY\s*=\s*)([^\s"']+)/gi, '$1[REDACTED]');
+}
+
+function getRawErrorMessage(err: unknown): string {
+  const errObj = err as { status?: number; code?: string | number; message?: string; name?: string };
+  if (err instanceof Error) return err.message || err.name;
+  if (typeof errObj?.message === 'string') return errObj.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
+function isModelUnavailableError(err: unknown): boolean {
+  const errObj = err as { status?: number; message?: string };
+  const rawMsg = getRawErrorMessage(err);
+  const lower = rawMsg.toLowerCase();
+  const statusNum = Number(errObj?.status || 0);
+  return (
+    statusNum === 404 ||
+    lower.includes('not_found') ||
+    lower.includes('is not found') ||
+    lower.includes('model not found') ||
+    lower.includes('models/') && lower.includes('not found') ||
+    (lower.includes('model') &&
+      (lower.includes('not found') ||
+        lower.includes('does not exist') ||
+        lower.includes('not supported') ||
+        lower.includes('is not supported for generatecontent')))
+  );
+}
+
+function isThinkingConfigUnsupportedError(err: unknown): boolean {
+  const lower = getRawErrorMessage(err).toLowerCase();
+  return (
+    lower.includes('thinkingconfig') ||
+    lower.includes('thinking_config') ||
+    lower.includes('thinkinglevel') ||
+    lower.includes('thinking_level') ||
+    lower.includes('thinkingbudget') ||
+    lower.includes('thinking_budget') ||
+    (lower.includes('thinking') &&
+      (lower.includes('not supported') ||
+        lower.includes('unsupported') ||
+        lower.includes('invalid') ||
+        lower.includes('unknown')))
+  );
+}
+
+export function classifyGeminiError(err: unknown, modelUsed?: string): AiServiceError {
   if (err instanceof AiServiceError) {
+    if (modelUsed && !err.modelUsed) err.modelUsed = modelUsed;
     return err;
   }
 
   const errObj = err as { status?: number; code?: string | number; message?: string; name?: string };
-  const rawMsg =
-    err instanceof Error
-      ? err.message
-      : typeof errObj?.message === 'string'
-      ? errObj.message
-      : (() => {
-          try {
-            return JSON.stringify(err);
-          } catch {
-            return String(err);
-          }
-        })();
+  const rawMsg = redactSecrets(getRawErrorMessage(err));
   const lower = rawMsg.toLowerCase();
   const statusNum = Number(errObj?.status || 0);
 
@@ -48,8 +102,10 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     return new AiServiceError(
       'GEMINI_API_KEY_MISSING',
       503,
-      'Hệ thống AI chưa được cấu hình khóa GEMINI_API_KEY trên máy chủ.',
-      rawMsg
+      'Bạn SOCO đang tạm nghỉ một chút để thầy cô chuẩn bị lại bài học. Em thử lại sau ít phút nhé!',
+      rawMsg,
+      'Thiếu biến môi trường GEMINI_API_KEY trên máy chủ.',
+      modelUsed
     );
   }
 
@@ -64,8 +120,10 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     return new AiServiceError(
       'GEMINI_API_KEY_INVALID',
       503,
-      'Khóa GEMINI_API_KEY trên máy chủ không hợp lệ hoặc chưa được cấp quyền truy cập Gemini API.',
-      rawMsg
+      'Bạn SOCO đang tạm nghỉ để thầy cô kiểm tra lại kết nối. Em hãy thử lại sau ít phút nhé!',
+      rawMsg,
+      'Khóa API không hợp lệ hoặc chưa được cấp quyền truy cập dịch vụ AI.',
+      modelUsed
     );
   }
 
@@ -73,23 +131,21 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     return new AiServiceError(
       'GEMINI_QUOTA_EXCEEDED',
       429,
-      'Hệ thống AI đang tạm hết hạn mức (quota) hoặc nhận quá nhiều yêu cầu. Vui lòng thử lại sau ít phút.',
-      rawMsg
+      'Hiện có nhiều bạn nhỏ đang trò chuyện cùng SOCO nên bạn ấy hơi bận một chút. Em đợi vài phút rồi hỏi lại nhé!',
+      rawMsg,
+      'Đã chạm hạn mức (quota/rate limit) gọi dịch vụ AI.',
+      modelUsed
     );
   }
 
-  if (
-    lower.includes('not_found') ||
-    statusNum === 404 ||
-    lower.includes('is not found') ||
-    lower.includes('model not found') ||
-    (lower.includes('model') && (lower.includes('not found') || lower.includes('does not exist') || lower.includes('not supported')))
-  ) {
+  if (isModelUnavailableError(err)) {
     return new AiServiceError(
       'GEMINI_MODEL_UNAVAILABLE',
       502,
-      'Mô hình AI được cấu hình hiện không khả dụng. Vui lòng kiểm tra cấu hình máy chủ.',
-      rawMsg
+      'Bạn SOCO đang cập nhật bài giảng mới nên tạm thời chưa trả lời được. Em thử lại sau ít phút nhé!',
+      rawMsg,
+      'Model AI đang cấu hình không tồn tại hoặc không được hỗ trợ (404 / NOT_FOUND).',
+      modelUsed
     );
   }
 
@@ -101,8 +157,10 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     return new AiServiceError(
       'INVALID_IMAGE',
       400,
-      'Định dạng ảnh chưa hợp lệ hoặc ảnh bị lỗi. Em hãy chọn hoặc chụp lại một bức ảnh rõ nét nhé!',
-      rawMsg
+      'Bức ảnh này hơi khó đọc hoặc chưa đúng định dạng. Em hãy chụp lại một bức ảnh thật rõ nét nhé!',
+      rawMsg,
+      'Dữ liệu hoặc định dạng hình ảnh đầu vào không hợp lệ.',
+      modelUsed
     );
   }
 
@@ -119,16 +177,20 @@ export function classifyGeminiError(err: unknown): AiServiceError {
     return new AiServiceError(
       'GEMINI_TIMEOUT',
       504,
-      'Kết nối tới dịch vụ Gemini AI bị quá thời gian phản hồi. Em hãy thử lại nhé!',
-      rawMsg
+      'SOCO đang suy nghĩ hơi lâu một chút nên bị ngắt kết nối. Em hãy gửi lại câu hỏi nhé!',
+      rawMsg,
+      'Yêu cầu gọi dịch vụ AI bị quá thời gian phản hồi (timeout).',
+      modelUsed
     );
   }
 
   return new AiServiceError(
     'GEMINI_UPSTREAM_ERROR',
     502,
-    'Dịch vụ Gemini AI tạm thời gặp sự cố khi xử lý yêu cầu. Em hãy thử lại sau ít phút nhé!',
-    rawMsg
+    'Kết nối với bạn SOCO đang tạm chập chờn. Em hãy thử gửi lại sau ít phút nhé!',
+    rawMsg,
+    'Dịch vụ AI phía máy chủ tạm thời gặp lỗi kết nối hoặc xử lý.',
+    modelUsed
   );
 }
 
@@ -138,7 +200,9 @@ function getAiClient() {
     throw new AiServiceError(
       'GEMINI_API_KEY_MISSING',
       503,
-      'Hệ thống AI chưa được cấu hình khóa GEMINI_API_KEY trên máy chủ.'
+      'Bạn SOCO đang tạm nghỉ một chút để thầy cô chuẩn bị lại bài học. Em thử lại sau ít phút nhé!',
+      'GEMINI_API_KEY_MISSING',
+      'Thiếu biến môi trường GEMINI_API_KEY trên máy chủ.'
     );
   }
   return new GoogleGenAI({
@@ -151,51 +215,36 @@ function getAiClient() {
   });
 }
 
-export const MODEL_NAME = 'gemini-4-hydrogen';
+const DEFAULT_MODEL_CANDIDATES = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 const DEFAULT_GEMINI_TIMEOUT_MS = 25000;
 
-export async function testGeminiConnection(): Promise<{
-  ok: boolean;
-  model: string;
-  code: string;
-  message: string;
-}> {
-  try {
-    const ai = getAiClient();
-    const response = await withTimeout(
-      ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: 'Trả lời đúng 1 từ: OK',
-        config: {
-          maxOutputTokens: 16,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      }),
-      12000
-    );
-    const hasText = Boolean(response && typeof response.text === 'string' && response.text.trim().length > 0);
-    return {
-      ok: true,
-      model: MODEL_NAME,
-      code: 'OK',
-      message: hasText
-        ? 'Kết nối Gemini AI hoạt động bình thường.'
-        : 'Gemini AI đã phản hồi thành công.',
-    };
-  } catch (err: unknown) {
-    const errName = err instanceof Error ? err.name : 'UnknownError';
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const safeMsg = rawMsg.replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]');
-    console.error(`Health AI check error [${errName}]:`, safeMsg);
-    const aiErr = classifyGeminiError(err);
-    return {
-      ok: false,
-      model: MODEL_NAME,
-      code: aiErr.code,
-      message: aiErr.userMessage,
-    };
+let rememberedWorkingModel: string | null = null;
+let lastSeenGeminiModelEnv: string | undefined = undefined;
+
+export function getConfiguredModels(): string[] {
+  const raw = process.env.GEMINI_MODEL?.trim();
+  if (raw !== lastSeenGeminiModelEnv) {
+    lastSeenGeminiModelEnv = raw;
+    rememberedWorkingModel = null;
   }
+  const parsed = raw
+    ? raw
+        .split(',')
+        .map((m) => m.trim())
+        .filter(Boolean)
+    : [];
+  const baseList = parsed.length > 0 ? Array.from(new Set(parsed)) : [...DEFAULT_MODEL_CANDIDATES];
+  if (rememberedWorkingModel && baseList.includes(rememberedWorkingModel)) {
+    return [rememberedWorkingModel, ...baseList.filter((m) => m !== rememberedWorkingModel)];
+  }
+  return baseList;
 }
+
+export function getActiveAiModel(): string {
+  return getConfiguredModels()[0];
+}
+
+export const MODEL_NAME = DEFAULT_MODEL_CANDIDATES[0];
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_GEMINI_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -213,29 +262,146 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs = DEFAULT_GEMINI_TI
   }
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
+async function runWithTransientRetry<T>(fn: () => Promise<T>, timeoutMs: number, maxRetries: number): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i <= maxRetries; i++) {
     try {
-      return await withTimeout(fn());
+      return await withTimeout(fn(), timeoutMs);
     } catch (err: unknown) {
+      lastErr = err;
+      if (isModelUnavailableError(err) || isThinkingConfigUnsupportedError(err)) {
+        throw err;
+      }
       const classified = classifyGeminiError(err);
-      lastErr = classified;
       if (
         classified.code === 'GEMINI_API_KEY_MISSING' ||
         classified.code === 'GEMINI_API_KEY_INVALID' ||
         classified.code === 'GEMINI_QUOTA_EXCEEDED' ||
-        classified.code === 'GEMINI_MODEL_UNAVAILABLE' ||
         classified.code === 'INVALID_IMAGE'
       ) {
-        throw classified;
+        throw err;
       }
       if (i < maxRetries) {
-        await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+        await new Promise((r) => setTimeout(r, 500 * (i + 1)));
       }
     }
   }
   throw lastErr;
+}
+
+export async function generateContentWithFallback(options: {
+  contents: GenerateContentParameters['contents'];
+  config?: GenerateContentParameters['config'];
+  timeoutMs?: number;
+  maxRetries?: number;
+  generateFn?: (params: GenerateContentParameters) => Promise<GenerateContentResponse>;
+}): Promise<{ response: GenerateContentResponse; modelUsed: string }> {
+  const invokeGenerate =
+    options.generateFn ??
+    ((params: GenerateContentParameters) => getAiClient().models.generateContent(params));
+  const candidates = getConfiguredModels();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GEMINI_TIMEOUT_MS;
+  const maxRetries = options.maxRetries ?? 1;
+
+  let lastModelError: AiServiceError | null = null;
+
+  for (const modelName of candidates) {
+    try {
+      const response = await runWithTransientRetry(
+        () =>
+          invokeGenerate({
+            model: modelName,
+            contents: options.contents,
+            config: options.config,
+          }),
+        timeoutMs,
+        maxRetries
+      );
+      rememberedWorkingModel = modelName;
+      return { response, modelUsed: modelName };
+    } catch (err: unknown) {
+      let currentErr = err;
+
+      if (options.config && 'thinkingConfig' in options.config && options.config.thinkingConfig !== undefined && isThinkingConfigUnsupportedError(err)) {
+        console.warn(`[AI] Model "${modelName}" rejected thinkingConfig, retrying once without thinkingConfig.`);
+        const { thinkingConfig: _removedThinking, ...configWithoutThinking } = options.config;
+        try {
+          const response = await runWithTransientRetry(
+            () =>
+              invokeGenerate({
+                model: modelName,
+                contents: options.contents,
+                config: configWithoutThinking,
+              }),
+            timeoutMs,
+            maxRetries
+          );
+          rememberedWorkingModel = modelName;
+          return { response, modelUsed: modelName };
+        } catch (retryErr: unknown) {
+          currentErr = retryErr;
+        }
+      }
+
+      if (isModelUnavailableError(currentErr)) {
+        console.warn(`[AI] Model "${modelName}" unavailable (${redactSecrets(getRawErrorMessage(currentErr))}), trying next candidate.`);
+        lastModelError = classifyGeminiError(currentErr, modelName);
+        continue;
+      }
+
+      throw classifyGeminiError(currentErr, modelName);
+    }
+  }
+
+  throw (
+    lastModelError ||
+    new AiServiceError(
+      'GEMINI_MODEL_UNAVAILABLE',
+      502,
+      'Bạn SOCO đang cập nhật bài giảng mới nên tạm thời chưa trả lời được. Em thử lại sau ít phút nhé!',
+      'ALL_MODEL_CANDIDATES_UNAVAILABLE',
+      'Tất cả model trong danh sách dự phòng đều không khả dụng.'
+    )
+  );
+}
+
+export async function testGeminiConnection(): Promise<{
+  ok: boolean;
+  model: string;
+  code: string;
+  message: string;
+}> {
+  try {
+    const { response, modelUsed } = await generateContentWithFallback({
+      contents: 'Trả lời đúng 1 từ: OK',
+      config: {
+        maxOutputTokens: 128,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      },
+      timeoutMs: 12000,
+      maxRetries: 0,
+    });
+    const hasText = Boolean(response && typeof response.text === 'string' && response.text.trim().length > 0);
+    return {
+      ok: true,
+      model: modelUsed,
+      code: 'OK',
+      message: hasText
+        ? 'Kết nối Gemini AI hoạt động bình thường.'
+        : 'Gemini AI đã phản hồi thành công.',
+    };
+  } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = redactSecrets(getRawErrorMessage(err));
+    console.error(`Health AI check error [${errName}]:`, rawMsg);
+    const aiErr = classifyGeminiError(err);
+    return {
+      ok: false,
+      model: aiErr.modelUsed || getActiveAiModel(),
+      code: aiErr.code,
+      message: aiErr.diagnosticMessage,
+    };
+  }
 }
 
 export interface ScanProblemResult {
@@ -247,6 +413,7 @@ export interface ScanProblemResult {
   topic: string;
   problemType: 'text' | 'formula' | 'table' | 'diagram' | 'mixed';
   readabilityFeedback: string;
+  modelUsed: string;
 }
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
@@ -317,7 +484,6 @@ export async function scanProblemImage(
   subjectHint?: string
 ): Promise<ScanProblemResult> {
   const { mimeType: resolvedMimeType, base64: cleanBase64 } = parseImagePayload(base64Data, mimeType);
-  const ai = getAiClient();
 
   const prompt = `Bạn là hệ thống OCR & phân tích đề bài tiểu học Việt Nam (Lớp 1–5) của SOCRATES KIDS AI.
 Hãy kiểm tra bức ảnh được gửi lên:
@@ -327,82 +493,86 @@ Hãy kiểm tra bức ảnh được gửi lên:
 4. Phân loại môn học (detectedSubject) thuộc chương trình tiểu học Việt Nam (Toán học, Tiếng Việt, Tự nhiên & Khoa học, Tiếng Anh, Đạo đức & Kỹ năng, Lịch sử & Địa lí, Tin học & Công nghệ), lớp dự kiến (detectedGrade từ 1 đến 5, tham khảo gợi ý lớp ${gradeHint || 4}), chủ đề (topic), và loại nội dung (problemType).
 ${subjectHint ? `Gợi ý môn từ học sinh: ${subjectHint}.` : ''}`;
 
-  return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: resolvedMimeType,
-              data: cleanBase64,
-            },
+  const { response, modelUsed } = await generateContentWithFallback({
+    contents: {
+      parts: [
+        {
+          inlineData: {
+            mimeType: resolvedMimeType,
+            data: cleanBase64,
           },
-          { text: prompt },
+        },
+        { text: prompt },
+      ],
+    },
+    config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          isReadable: { type: Type.BOOLEAN },
+          safetyPassed: { type: Type.BOOLEAN },
+          extractedText: { type: Type.STRING },
+          detectedSubject: { type: Type.STRING },
+          detectedGrade: { type: Type.INTEGER },
+          topic: { type: Type.STRING },
+          problemType: { type: Type.STRING },
+          readabilityFeedback: { type: Type.STRING },
+        },
+        required: [
+          'isReadable',
+          'safetyPassed',
+          'extractedText',
+          'detectedSubject',
+          'detectedGrade',
+          'topic',
+          'problemType',
+          'readabilityFeedback',
         ],
       },
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            isReadable: { type: Type.BOOLEAN },
-            safetyPassed: { type: Type.BOOLEAN },
-            extractedText: { type: Type.STRING },
-            detectedSubject: { type: Type.STRING },
-            detectedGrade: { type: Type.INTEGER },
-            topic: { type: Type.STRING },
-            problemType: { type: Type.STRING },
-            readabilityFeedback: { type: Type.STRING },
-          },
-          required: [
-            'isReadable',
-            'safetyPassed',
-            'extractedText',
-            'detectedSubject',
-            'detectedGrade',
-            'topic',
-            'problemType',
-            'readabilityFeedback',
-          ],
-        },
-      },
-    });
-
-    const rawText = (response.text ?? '').trim();
-    if (!rawText) {
-      throw new AiServiceError(
-        'GEMINI_UPSTREAM_ERROR',
-        502,
-        'Gemini AI không trả về nội dung nhận dạng. Em hãy thử chụp lại ảnh rõ hơn nhé!'
-      );
-    }
-
-    let parsed: ScanProblemResult;
-    try {
-      parsed = JSON.parse(rawText) as ScanProblemResult;
-    } catch {
-      throw new AiServiceError(
-        'GEMINI_UPSTREAM_ERROR',
-        502,
-        'Dữ liệu nhận dạng từ AI chưa đúng định dạng. Em hãy thử quét lại nhé!'
-      );
-    }
-
-    return {
-      isReadable: Boolean(parsed.isReadable),
-      safetyPassed: parsed.safetyPassed !== false,
-      extractedText: parsed.extractedText || '',
-      detectedSubject: parsed.detectedSubject || subjectHint || 'Toán học',
-      detectedGrade: Math.min(5, Math.max(1, Number(parsed.detectedGrade) || gradeHint || 4)),
-      topic: parsed.topic || 'Bài tập từ ảnh chụp',
-      problemType: (['text', 'formula', 'table', 'diagram', 'mixed'].includes(parsed.problemType)
-        ? parsed.problemType
-        : 'text') as ScanProblemResult['problemType'],
-      readabilityFeedback: parsed.readabilityFeedback || '',
-    };
+    },
   });
+
+  const rawText = (response.text ?? '').trim();
+  if (!rawText) {
+    throw new AiServiceError(
+      'GEMINI_UPSTREAM_ERROR',
+      502,
+      'SOCO chưa đọc được chữ trong ảnh lần này. Em hãy thử chụp lại ảnh rõ nét hơn nhé!',
+      'EMPTY_OCR_RESPONSE',
+      'AI không trả về nội dung nhận dạng.',
+      modelUsed
+    );
+  }
+
+  let parsed: Omit<ScanProblemResult, 'modelUsed'>;
+  try {
+    parsed = JSON.parse(rawText) as Omit<ScanProblemResult, 'modelUsed'>;
+  } catch {
+    throw new AiServiceError(
+      'GEMINI_UPSTREAM_ERROR',
+      502,
+      'SOCO chưa đọc được rõ đề bài trong ảnh này. Em hãy thử quét lại nhé!',
+      'INVALID_JSON_OCR_RESPONSE',
+      'Dữ liệu nhận dạng từ AI chưa đúng định dạng JSON.',
+      modelUsed
+    );
+  }
+
+  return {
+    isReadable: Boolean(parsed.isReadable),
+    safetyPassed: parsed.safetyPassed !== false,
+    extractedText: parsed.extractedText || '',
+    detectedSubject: parsed.detectedSubject || subjectHint || 'Toán học',
+    detectedGrade: Math.min(5, Math.max(1, Number(parsed.detectedGrade) || gradeHint || 4)),
+    topic: parsed.topic || 'Bài tập từ ảnh chụp',
+    problemType: (['text', 'formula', 'table', 'diagram', 'mixed'].includes(parsed.problemType)
+      ? parsed.problemType
+      : 'text') as ScanProblemResult['problemType'],
+    readabilityFeedback: parsed.readabilityFeedback || '',
+    modelUsed,
+  };
 }
 
 export interface SocraticTurnInput {
@@ -438,6 +608,7 @@ export interface SocraticTurnOutput {
   isSolvedByStudent: boolean;
   similarChallengeProblem: string;
   safetyFlagged: boolean;
+  modelUsed: string;
 }
 
 function getGradeDifferentiationGuide(gradeLevel: number): string {
@@ -487,8 +658,6 @@ function getModeInstructions(mode: string, hintLevel: number, revealSolutionRequ
 }
 
 export async function generateSocraticTurn(input: SocraticTurnInput): Promise<SocraticTurnOutput> {
-  const ai = getAiClient();
-
   const systemInstruction = `Bạn là SOCO, người bạn đồng hành học tập thông minh của học sinh tiểu học Việt Nam từ lớp 1 đến lớp 5 thuộc nền tảng SOCRATES KIDS AI.
 Bạn KHÔNG phải là công cụ giải bài tập tự động. Sứ mệnh của bạn là giúp học sinh TỰ KHÁM PHÁ KIẾN THỨC.
 
@@ -531,81 +700,79 @@ Tin nhắn mới của học sinh:
 
 Hãy phản hồi sư phạm chuẩn mực và trả về JSON đầy đủ các trường theo schema.`;
 
-  return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reply: { type: Type.STRING },
-            socoEmotion: { type: Type.STRING },
-            pedagogicalAnalysis: {
-              type: Type.OBJECT,
-              properties: {
-                questionGoal: { type: Type.STRING },
-                testedSkill: { type: Type.STRING },
-                understandingLevel: { type: Type.INTEGER },
-                detectedMistake: { type: Type.STRING },
-                mistakeCategory: { type: Type.STRING },
-                nextStepHint: { type: Type.STRING },
-              },
-              required: ['questionGoal', 'testedSkill', 'understandingLevel', 'detectedMistake', 'mistakeCategory', 'nextStepHint'],
+  const { response, modelUsed } = await generateContentWithFallback({
+    contents: prompt,
+    config: {
+      systemInstruction,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          reply: { type: Type.STRING },
+          socoEmotion: { type: Type.STRING },
+          pedagogicalAnalysis: {
+            type: Type.OBJECT,
+            properties: {
+              questionGoal: { type: Type.STRING },
+              testedSkill: { type: Type.STRING },
+              understandingLevel: { type: Type.INTEGER },
+              detectedMistake: { type: Type.STRING },
+              mistakeCategory: { type: Type.STRING },
+              nextStepHint: { type: Type.STRING },
             },
-            detectedSubject: { type: Type.STRING },
-            topic: { type: Type.STRING },
-            learningObjective: { type: Type.STRING },
-            difficulty: { type: Type.STRING },
-            prerequisites: { type: Type.ARRAY, items: { type: Type.STRING } },
-            isSolvedByStudent: { type: Type.BOOLEAN },
-            similarChallengeProblem: { type: Type.STRING },
-            safetyFlagged: { type: Type.BOOLEAN },
+            required: ['questionGoal', 'testedSkill', 'understandingLevel', 'detectedMistake', 'mistakeCategory', 'nextStepHint'],
           },
-          required: [
-            'reply',
-            'socoEmotion',
-            'pedagogicalAnalysis',
-            'detectedSubject',
-            'topic',
-            'learningObjective',
-            'difficulty',
-            'prerequisites',
-            'isSolvedByStudent',
-            'similarChallengeProblem',
-            'safetyFlagged',
-          ],
+          detectedSubject: { type: Type.STRING },
+          topic: { type: Type.STRING },
+          learningObjective: { type: Type.STRING },
+          difficulty: { type: Type.STRING },
+          prerequisites: { type: Type.ARRAY, items: { type: Type.STRING } },
+          isSolvedByStudent: { type: Type.BOOLEAN },
+          similarChallengeProblem: { type: Type.STRING },
+          safetyFlagged: { type: Type.BOOLEAN },
         },
+        required: [
+          'reply',
+          'socoEmotion',
+          'pedagogicalAnalysis',
+          'detectedSubject',
+          'topic',
+          'learningObjective',
+          'difficulty',
+          'prerequisites',
+          'isSolvedByStudent',
+          'similarChallengeProblem',
+          'safetyFlagged',
+        ],
       },
-    });
-
-    const parsed = JSON.parse((response.text ?? '{}').trim()) as SocraticTurnOutput;
-    const validEmotions = ['happy', 'thinking', 'cheering', 'explaining'];
-    const validDiff = ['easy', 'medium', 'hard'];
-    return {
-      reply: parsed.reply || 'SOCO đang lắng nghe em đây! Em có thể nói thêm một chút về điều em đang nghĩ không?',
-      socoEmotion: (validEmotions.includes(parsed.socoEmotion) ? parsed.socoEmotion : 'explaining') as SocraticTurnOutput['socoEmotion'],
-      pedagogicalAnalysis: {
-        questionGoal: parsed.pedagogicalAnalysis?.questionGoal || 'Gợi mở tư duy từng bước',
-        testedSkill: parsed.pedagogicalAnalysis?.testedSkill || input.topic,
-        understandingLevel: Math.min(5, Math.max(1, Number(parsed.pedagogicalAnalysis?.understandingLevel) || 3)),
-        detectedMistake: parsed.pedagogicalAnalysis?.detectedMistake || '',
-        mistakeCategory: parsed.pedagogicalAnalysis?.mistakeCategory || '',
-        nextStepHint: parsed.pedagogicalAnalysis?.nextStepHint || '',
-      },
-      detectedSubject: parsed.detectedSubject || input.subjectName,
-      topic: parsed.topic || input.topic,
-      learningObjective: parsed.learningObjective || 'Hiểu bản chất kiến thức và tự tìm lời giải',
-      difficulty: (validDiff.includes(parsed.difficulty) ? parsed.difficulty : 'medium') as SocraticTurnOutput['difficulty'],
-      prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.slice(0, 4) : [],
-      isSolvedByStudent: Boolean(parsed.isSolvedByStudent),
-      similarChallengeProblem: parsed.similarChallengeProblem || '',
-      safetyFlagged: Boolean(parsed.safetyFlagged),
-    };
+    },
   });
+
+  const parsed = JSON.parse((response.text ?? '{}').trim()) as Omit<SocraticTurnOutput, 'modelUsed'>;
+  const validEmotions = ['happy', 'thinking', 'cheering', 'explaining'];
+  const validDiff = ['easy', 'medium', 'hard'];
+  return {
+    reply: parsed.reply || 'SOCO đang lắng nghe em đây! Em có thể nói thêm một chút về điều em đang nghĩ không?',
+    socoEmotion: (validEmotions.includes(parsed.socoEmotion) ? parsed.socoEmotion : 'explaining') as SocraticTurnOutput['socoEmotion'],
+    pedagogicalAnalysis: {
+      questionGoal: parsed.pedagogicalAnalysis?.questionGoal || 'Gợi mở tư duy từng bước',
+      testedSkill: parsed.pedagogicalAnalysis?.testedSkill || input.topic,
+      understandingLevel: Math.min(5, Math.max(1, Number(parsed.pedagogicalAnalysis?.understandingLevel) || 3)),
+      detectedMistake: parsed.pedagogicalAnalysis?.detectedMistake || '',
+      mistakeCategory: parsed.pedagogicalAnalysis?.mistakeCategory || '',
+      nextStepHint: parsed.pedagogicalAnalysis?.nextStepHint || '',
+    },
+    detectedSubject: parsed.detectedSubject || input.subjectName,
+    topic: parsed.topic || input.topic,
+    learningObjective: parsed.learningObjective || 'Hiểu bản chất kiến thức và tự tìm lời giải',
+    difficulty: (validDiff.includes(parsed.difficulty) ? parsed.difficulty : 'medium') as SocraticTurnOutput['difficulty'],
+    prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.slice(0, 4) : [],
+    isSolvedByStudent: Boolean(parsed.isSolvedByStudent),
+    similarChallengeProblem: parsed.similarChallengeProblem || '',
+    safetyFlagged: Boolean(parsed.safetyFlagged),
+    modelUsed,
+  };
 }
 
 export async function generateParentCompanionAdvice(params: {
@@ -614,8 +781,7 @@ export async function generateParentCompanionAdvice(params: {
   masterySummary: string;
   mistakesSummary: string;
   studyMinutes: number;
-}): Promise<{ summary: string; homeActivities: Array<{ title: string; duration: string; howTo: string }> }> {
-  const ai = getAiClient();
+}): Promise<{ summary: string; homeActivities: Array<{ title: string; duration: string; howTo: string }>; modelUsed: string }> {
   const prompt = `Bạn là chuyên gia giáo dục tiểu học Việt Nam tư vấn cho phụ huynh.
 Học sinh: ${params.studentName}, Lớp ${params.gradeLevel}.
 Thời gian học đã ghi nhận: ${params.studyMinutes} phút.
@@ -626,36 +792,37 @@ Hãy viết bằng Tiếng Việt ấm áp, không gây áp lực điểm số:
 1. summary: Nhận xét ngắn gọn, khích lệ về tiến bộ và điểm cần đồng hành nhẹ nhàng.
 2. homeActivities: 3 hoạt động đồng hành tại nhà 10–15 phút gắn với sinh hoạt gia đình.`;
 
-  return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: { type: Type.STRING },
-            homeActivities: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  duration: { type: Type.STRING },
-                  howTo: { type: Type.STRING },
-                },
-                required: ['title', 'duration', 'howTo'],
+  const { response, modelUsed } = await generateContentWithFallback({
+    contents: prompt,
+    config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          summary: { type: Type.STRING },
+          homeActivities: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                duration: { type: Type.STRING },
+                howTo: { type: Type.STRING },
               },
+              required: ['title', 'duration', 'howTo'],
             },
           },
-          required: ['summary', 'homeActivities'],
         },
+        required: ['summary', 'homeActivities'],
       },
-    });
-    return JSON.parse((response.text ?? '{}').trim());
+    },
   });
+  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+    summary: string;
+    homeActivities: Array<{ title: string; duration: string; howTo: string }>;
+  };
+  return { ...parsed, modelUsed };
 }
 
 export async function generateTeacherClassInsights(params: {
@@ -664,8 +831,7 @@ export async function generateTeacherClassInsights(params: {
   studentCount: number;
   commonMistakes: string;
   avgScore: number;
-}): Promise<{ overview: string; actionPlan: string[] }> {
-  const ai = getAiClient();
+}): Promise<{ overview: string; actionPlan: string[]; modelUsed: string }> {
   const prompt = `Bạn là cố vấn sư phạm tiểu học hỗ trợ giáo viên phân tích dữ liệu lớp học.
 Lớp: ${params.className} (Lớp ${params.gradeLevel}), Sĩ số: ${params.studentCount} học sinh.
 Điểm trung bình bài tập: ${params.avgScore}%.
@@ -675,25 +841,23 @@ Hãy đề xuất ngắn gọn bằng Tiếng Việt:
 1. overview: Nhận định tổng quan năng lực lớp.
 2. actionPlan: 3 biện pháp sư phạm Socratic trên lớp để giúp học sinh khắc phục lỗi sai.`;
 
-  return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            overview: { type: Type.STRING },
-            actionPlan: { type: Type.ARRAY, items: { type: Type.STRING } },
-          },
-          required: ['overview', 'actionPlan'],
+  const { response, modelUsed } = await generateContentWithFallback({
+    contents: prompt,
+    config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          overview: { type: Type.STRING },
+          actionPlan: { type: Type.ARRAY, items: { type: Type.STRING } },
         },
+        required: ['overview', 'actionPlan'],
       },
-    });
-    return JSON.parse((response.text ?? '{}').trim());
+    },
   });
+  const parsed = JSON.parse((response.text ?? '{}').trim()) as { overview: string; actionPlan: string[] };
+  return { ...parsed, modelUsed };
 }
 
 export async function generateTeacherExerciseDraft(params: {
@@ -711,8 +875,8 @@ export async function generateTeacherExerciseDraft(params: {
     correctAnswer: string;
     explanation: string;
   }>;
+  modelUsed: string;
 }> {
-  const ai = getAiClient();
   const count = Math.min(8, Math.max(2, Number(params.questionCount) || 4));
   const diff = params.difficulty || 'medium';
 
@@ -730,75 +894,76 @@ Yêu cầu nghiêm ngặt:
 3. Trường explanation giải thích ngắn gọn, dễ hiểu vì sao đáp án đó đúng để giúp học sinh tự suy nghĩ.
 4. Xuất JSON đúng theo schema.`;
 
-  return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            questions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  prompt: { type: Type.STRING },
-                  options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  correctAnswer: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
-                },
-                required: ['prompt', 'options', 'correctAnswer', 'explanation'],
+  const { response, modelUsed } = await generateContentWithFallback({
+    contents: prompt,
+    config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          questions: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                prompt: { type: Type.STRING },
+                options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                correctAnswer: { type: Type.STRING },
+                explanation: { type: Type.STRING },
               },
+              required: ['prompt', 'options', 'correctAnswer', 'explanation'],
             },
           },
-          required: ['title', 'questions'],
         },
+        required: ['title', 'questions'],
       },
-    });
-
-    const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-      title?: string;
-      questions?: Array<{
-        prompt?: string;
-        options?: string[];
-        correctAnswer?: string;
-        explanation?: string;
-      }>;
-    };
-
-    const sanitizedQuestions = (Array.isArray(parsed.questions) ? parsed.questions : [])
-      .slice(0, count)
-      .map((q) => {
-        const opts = Array.isArray(q.options) ? q.options.map((o) => String(o).trim()).filter(Boolean) : [];
-        let ans = String(q.correctAnswer || '').trim();
-        if (opts.length > 0 && !opts.includes(ans)) {
-          ans = opts[0];
-        }
-        return {
-          prompt: String(q.prompt || '').trim(),
-          options: opts.length >= 2 ? opts : [ans || 'Đáp án A', 'Đáp án B'],
-          correctAnswer: ans || opts[0] || 'Đáp án A',
-          explanation: String(q.explanation || 'Giáo viên duyệt nội dung giải thích.').trim(),
-        };
-      })
-      .filter((q) => q.prompt.length > 0);
-
-    if (sanitizedQuestions.length === 0) {
-      throw new AiServiceError(
-        'GEMINI_UPSTREAM_ERROR',
-        502,
-        'AI chưa tạo được câu hỏi hợp lệ. Thầy/cô vui lòng thử lại với chủ đề cụ thể hơn nhé.'
-      );
-    }
-
-    return {
-      title: String(parsed.title || `Bài tập AI (Nháp): ${params.topic}`).trim(),
-      difficulty: diff,
-      questions: sanitizedQuestions,
-    };
+    },
   });
+
+  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+    title?: string;
+    questions?: Array<{
+      prompt?: string;
+      options?: string[];
+      correctAnswer?: string;
+      explanation?: string;
+    }>;
+  };
+
+  const sanitizedQuestions = (Array.isArray(parsed.questions) ? parsed.questions : [])
+    .slice(0, count)
+    .map((q) => {
+      const opts = Array.isArray(q.options) ? q.options.map((o) => String(o).trim()).filter(Boolean) : [];
+      let ans = String(q.correctAnswer || '').trim();
+      if (opts.length > 0 && !opts.includes(ans)) {
+        ans = opts[0];
+      }
+      return {
+        prompt: String(q.prompt || '').trim(),
+        options: opts.length >= 2 ? opts : [ans || 'Đáp án A', 'Đáp án B'],
+        correctAnswer: ans || opts[0] || 'Đáp án A',
+        explanation: String(q.explanation || 'Giáo viên duyệt nội dung giải thích.').trim(),
+      };
+    })
+    .filter((q) => q.prompt.length > 0);
+
+  if (sanitizedQuestions.length === 0) {
+    throw new AiServiceError(
+      'GEMINI_UPSTREAM_ERROR',
+      502,
+      'Chưa tạo được câu hỏi phù hợp. Thầy/cô vui lòng thử lại với chủ đề cụ thể hơn nhé.',
+      'EMPTY_GENERATED_QUESTIONS',
+      'AI không trả về câu hỏi hợp lệ.',
+      modelUsed
+    );
+  }
+
+  return {
+    title: String(parsed.title || `Bài tập AI (Nháp): ${params.topic}`).trim(),
+    difficulty: diff,
+    questions: sanitizedQuestions,
+    modelUsed,
+  };
 }

@@ -22,6 +22,8 @@ import {
   generateSocraticTurn,
   generateTeacherClassInsights,
   generateTeacherExerciseDraft,
+  getActiveAiModel,
+  redactSecrets,
   scanProblemImage,
 } from './ai.ts';
 
@@ -709,8 +711,8 @@ apiRouter.post('/ai/scan-problem', authenticate, async (req: AuthRequest, res: R
     if (safetyEnabled && !result.safetyPassed) {
       db.prepare(
         `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, status, safety_flagged, latency_ms)
-         VALUES (?, '/api/ai/scan-problem', 'gemini-4-hydrogen', ?, 'blocked_safety', 1, ?)`
-      ).run(req.user!.id, gradeHint || null, Date.now() - start);
+         VALUES (?, '/api/ai/scan-problem', ?, ?, 'blocked_safety', 1, ?)`
+      ).run(req.user!.id, result.modelUsed, gradeHint || null, Date.now() - start);
       return res.status(400).json({
         error: 'Hình ảnh chưa phù hợp với nội dung học tập tiểu học. Em hãy chụp lại trang vở hoặc sách giáo khoa nhé!',
       });
@@ -718,8 +720,8 @@ apiRouter.post('/ai/scan-problem', authenticate, async (req: AuthRequest, res: R
 
     db.prepare(
       `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, status, safety_flagged, latency_ms)
-       VALUES (?, '/api/ai/scan-problem', 'gemini-4-hydrogen', ?, 'success', 0, ?)`
-    ).run(req.user!.id, result.detectedGrade, Date.now() - start);
+       VALUES (?, '/api/ai/scan-problem', ?, ?, 'success', 0, ?)`
+    ).run(req.user!.id, result.modelUsed, result.detectedGrade, Date.now() - start);
 
     if (req.user!.role === 'student') {
       awardStudentXpAndMissions(req.user!.id, 10, 'scan_problem');
@@ -727,12 +729,14 @@ apiRouter.post('/ai/scan-problem', authenticate, async (req: AuthRequest, res: R
 
     res.json({ result });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error('Scan problem error:', aiErr.message);
+    console.error(`Scan problem error [${errName}] (${aiErr.code}):`, rawMsg);
     try {
       db.prepare(
-        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/scan-problem', 'gemini-4-hydrogen', 'error', ?)`
-      ).run(req.user!.id, Date.now() - start);
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/scan-problem', ?, 'error', ?)`
+      ).run(req.user!.id, aiErr.modelUsed || getActiveAiModel(), Date.now() - start);
     } catch {
       // Ignore logging error
     }
@@ -981,8 +985,8 @@ apiRouter.post('/ai/tutor', authenticate, async (req: AuthRequest, res: Response
 
     db.prepare(
       `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, mode, prompt_tokens_est, status, safety_flagged, latency_ms)
-       VALUES (?, '/api/ai/tutor', 'gemini-4-hydrogen', ?, ?, ?, 'success', ?, ?)`
-    ).run(req.user!.id, gradeRow.level, mode, Math.ceil(message.length / 4), aiOut.safetyFlagged ? 1 : 0, Date.now() - start);
+       VALUES (?, '/api/ai/tutor', ?, ?, ?, ?, 'success', ?, ?)`
+    ).run(req.user!.id, aiOut.modelUsed, gradeRow.level, mode, Math.ceil(message.length / 4), aiOut.safetyFlagged ? 1 : 0, Date.now() - start);
 
     res.json({
       sessionId: activeSessionId,
@@ -992,13 +996,13 @@ apiRouter.post('/ai/tutor', authenticate, async (req: AuthRequest, res: Response
     });
   } catch (err: unknown) {
     const errName = err instanceof Error ? err.name : 'UnknownError';
-    const rawMsg = (err instanceof Error ? err.message : String(err)).replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED_KEY]');
+    const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
     console.error(`Socratic tutor error [${errName}] (${aiErr.code}):`, rawMsg);
     try {
       db.prepare(
-        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', 'gemini-4-hydrogen', 'error', ?)`
-      ).run(req.user!.id, Date.now() - start);
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/ai/tutor', ?, 'error', ?)`
+      ).run(req.user!.id, aiErr.modelUsed || getActiveAiModel(), Date.now() - start);
     } catch {
       // Ignore logging error
     }
@@ -1457,8 +1461,8 @@ apiRouter.post('/teacher/ai-generate-exercise', authenticate, requireRole('teach
 
     db.prepare(
       `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, mode, status, safety_flagged, latency_ms)
-       VALUES (?, '/api/teacher/ai-generate-exercise', 'gemini-4-hydrogen', ?, 'teacher_draft', 'success', 0, ?)`
-    ).run(req.user!.id, lvl, Date.now() - start);
+       VALUES (?, '/api/teacher/ai-generate-exercise', ?, ?, 'teacher_draft', 'success', 0, ?)`
+    ).run(req.user!.id, draft.modelUsed, lvl, Date.now() - start);
 
     res.status(201).json({
       exerciseId,
@@ -1468,8 +1472,17 @@ apiRouter.post('/teacher/ai-generate-exercise', authenticate, requireRole('teach
       message: 'Đã tạo bản nháp bài tập bằng AI (Cần giáo viên duyệt). Học sinh chưa thể thấy bài này cho tới khi được duyệt và xuất bản.',
     });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error('AI exercise draft error:', aiErr.message);
+    console.error(`AI exercise draft error [${errName}] (${aiErr.code}):`, rawMsg);
+    try {
+      db.prepare(
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/teacher/ai-generate-exercise', ?, 'error', ?)`
+      ).run(req.user!.id, aiErr.modelUsed || getActiveAiModel(), Date.now() - start);
+    } catch {
+      // Ignore logging error
+    }
     res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
@@ -1742,6 +1755,7 @@ apiRouter.patch('/content/exercises/:id/review', authenticate, requireRole('teac
 });
 
 apiRouter.post('/teacher/ai-insights', authenticate, requireRole('teacher', 'admin'), async (req: AuthRequest, res: Response) => {
+  const start = Date.now();
   try {
     const { className, gradeLevel, studentCount, commonMistakes, avgScore } = req.body || {};
     const insights = await generateTeacherClassInsights({
@@ -1751,10 +1765,23 @@ apiRouter.post('/teacher/ai-insights', authenticate, requireRole('teacher', 'adm
       commonMistakes: String(commonMistakes || ''),
       avgScore: Number(avgScore) || 75,
     });
+    db.prepare(
+      `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, mode, status, safety_flagged, latency_ms)
+       VALUES (?, '/api/teacher/ai-insights', ?, ?, 'teacher_insights', 'success', 0, ?)`
+    ).run(req.user!.id, insights.modelUsed, Number(gradeLevel) || 4, Date.now() - start);
     res.json({ insights });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error('Teacher insights error:', aiErr.message);
+    console.error(`Teacher insights error [${errName}] (${aiErr.code}):`, rawMsg);
+    try {
+      db.prepare(
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/teacher/ai-insights', ?, 'error', ?)`
+      ).run(req.user!.id, aiErr.modelUsed || getActiveAiModel(), Date.now() - start);
+    } catch {
+      // Ignore logging error
+    }
     res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
@@ -1876,6 +1903,7 @@ apiRouter.post('/parent/link-student', authenticate, requireRole('parent'), (req
 });
 
 apiRouter.post('/parent/ai-advice', authenticate, requireRole('parent', 'admin'), async (req: AuthRequest, res: Response) => {
+  const start = Date.now();
   try {
     const { studentId } = req.body || {};
     const sid = Number(studentId);
@@ -1919,10 +1947,24 @@ apiRouter.post('/parent/ai-advice', authenticate, requireRole('parent', 'admin')
       studyMinutes: Math.round(child.total_seconds / 60),
     });
 
+    db.prepare(
+      `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, grade_level, mode, status, safety_flagged, latency_ms)
+       VALUES (?, '/api/parent/ai-advice', ?, ?, 'parent_advice', 'success', 0, ?)`
+    ).run(req.user!.id, advice.modelUsed, child.grade_level, Date.now() - start);
+
     res.json({ advice });
   } catch (err: unknown) {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    const rawMsg = redactSecrets(err instanceof Error ? err.message : String(err));
     const aiErr = classifyGeminiError(err);
-    console.error('Parent advice error:', aiErr.message);
+    console.error(`Parent advice error [${errName}] (${aiErr.code}):`, rawMsg);
+    try {
+      db.prepare(
+        `INSERT INTO ai_usage_logs (user_id, endpoint, model_name, status, latency_ms) VALUES (?, '/api/parent/ai-advice', ?, 'error', ?)`
+      ).run(req.user!.id, aiErr.modelUsed || getActiveAiModel(), Date.now() - start);
+    } catch {
+      // Ignore logging error
+    }
     res.status(aiErr.status).json({ error: aiErr.userMessage, code: aiErr.code });
   }
 });
